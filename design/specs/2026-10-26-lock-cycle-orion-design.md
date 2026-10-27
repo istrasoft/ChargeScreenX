@@ -37,7 +37,7 @@ State per kind:
 
 Rules:
 - **Unlocked:** an advert is a *good candidate* when the key-byte check passes, decryption succeeds, and the decoded values are plausible:
-  - shunt: 5.0 V ≤ voltage ≤ 70.0 V and 0 % ≤ SOC ≤ 100 %
+  - shunt: 5.0 V ≤ voltage ≤ 70.0 V and (0 % ≤ SOC ≤ 100 % or SOC = 102.3 %, Victron's "not available" value sent before the shunt has synchronised)
   - solar: battery voltage is NaN or 5.0–70.0 V
   - Orion XS: output voltage is NaN or 5.0–70.0 V
   
