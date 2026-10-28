@@ -187,6 +187,10 @@ OrionStats orionStats;
 static cs::DeviceLock shuntLock;
 static cs::DeviceLock solarLock;
 static cs::DeviceLock orionLock;
+// Set by the BLE task when a lock is created; loop() saves it to NVS.
+static volatile bool shuntLockDirty = false;
+static volatile bool solarLockDirty = false;
+static volatile bool orionLockDirty = false;
 static bool gaugeFaceDrawn = false;
 static bool gaugeValuesDrawn = false;
 static int lastSocDisplay = -1;
@@ -1573,8 +1577,31 @@ static void restartBleScan(const char *reason) {
   lastBleScanStartMs = millis();
 }
 
+static volatile bool &lockDirtyFlag(const cs::DeviceLock &lock) {
+  if (&lock == &solarLock) {
+    return solarLockDirty;
+  }
+  if (&lock == &orionLock) {
+    return orionLockDirty;
+  }
+  return shuntLockDirty;
+}
+
+// Runs in loop(); the BLE callback only marks the lock dirty.
+static void persistVictronLock(cs::DeviceLock &lock, const char *nvsKey) {
+  volatile bool &dirty = lockDirtyFlag(lock);
+  if (!dirty) {
+    return;
+  }
+  dirty = false;
+  if (cs::lockIsLocked(lock)) {
+    secrets.putString(nvsKey, lock.locked);
+  }
+}
+
 static void releaseVictronLock(cs::DeviceLock &lock, const char *nvsKey, const char *kind, const char *reason) {
   bool wasLocked = cs::lockIsLocked(lock);
+  lockDirtyFlag(lock) = false;
   cs::lockClear(lock);
   secrets.remove(nvsKey);
   if (wasLocked) {
@@ -1591,13 +1618,13 @@ static String lockStatusText(const cs::DeviceLock &lock) {
   return String("Locked to ") + mac;
 }
 
+// Runs on the NimBLE host task: no NVS access here, see persistVictronLock().
 static void noteVictronGoodDecode(cs::DeviceLock &lock,
-                                  const char *nvsKey,
                                   const char *kind,
                                   const char *mac,
                                   const String &address) {
   if (cs::lockNoteGoodDecode(lock, mac, millis())) {
-    secrets.putString(nvsKey, mac);
+    lockDirtyFlag(lock) = true;
     Serial.printf("Victron %s locked to %s\n", kind, address.c_str());
   }
 }
@@ -1630,7 +1657,7 @@ static void handleShuntAdvert(const String &name,
   if (ok) {
     victronStats = decoded;
     lastVictronDecodeMs = now;
-    noteVictronGoodDecode(shuntLock, "shunt_mac", "shunt", mac, address);
+    noteVictronGoodDecode(shuntLock, "shunt", mac, address);
   } else if (!victronStats.valid) {
     victronStats.error = error;
   }
@@ -1670,7 +1697,7 @@ static void handleSolarAdvert(const String &name,
   if (ok) {
     solarStats = decoded;
     lastSolarDecodeMs = now;
-    noteVictronGoodDecode(solarLock, "solar_mac", "solar", mac, address);
+    noteVictronGoodDecode(solarLock, "solar", mac, address);
   } else if (!solarStats.valid) {
     solarStats.error = error;
   }
@@ -1710,7 +1737,7 @@ static void handleOrionAdvert(const String &name,
   if (ok) {
     orionStats = decoded;
     lastOrionDecodeMs = now;
-    noteVictronGoodDecode(orionLock, "orion_mac", "Orion XS", mac, address);
+    noteVictronGoodDecode(orionLock, "Orion XS", mac, address);
   } else if (!orionStats.valid) {
     orionStats.error = error;
   }
@@ -3629,6 +3656,9 @@ void loop() {
   static uint32_t lastDraw = 0;
   updateSettingsServer();
   updateBleWatchdog();
+  persistVictronLock(shuntLock, "shunt_mac");
+  persistVictronLock(solarLock, "solar_mac");
+  persistVictronLock(orionLock, "orion_mac");
   updateTouchSwipe();
   updateAutoCycle();
   updateScreenTimeout();
