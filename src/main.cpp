@@ -4,12 +4,10 @@
 #include <LittleFS.h>
 #include <NimBLEDevice.h>
 #include <Preferences.h>
-#include <Update.h>
 #include <WebServer.h>
 #include <WiFi.h>
 #include <Wire.h>
 #include <mbedtls/aes.h>
-#include <mbedtls/sha256.h>
 #include <math.h>
 
 #include "aa_font.h"
@@ -123,13 +121,6 @@ Arduino_GFX *gfx = new Arduino_GC9A01(
 Preferences secrets;
 WebServer settingsServer(80);
 DNSServer captiveDnsServer;
-static bool firmwareUploadFailed = false;
-static bool firmwareUploadFinished = false;
-static bool firmwareHeaderChecked = false;
-static bool firmwareHashActive = false;
-static size_t firmwareUploadSize = 0;
-static uint8_t firmwareDigest[32] = {};
-static mbedtls_sha256_context firmwareSha;
 
 struct BleSeen {
   String name = "-";
@@ -1689,12 +1680,6 @@ static String settingsStatusMessage(const String &code) {
   if (code == "invalid") {
     return "Check key/password/settings format.";
   }
-  if (code == "ota-ok") {
-    return "Firmware uploaded. Device is restarting.";
-  }
-  if (code == "ota-failed") {
-    return "Firmware update failed. Try the correct firmware.bin.";
-  }
   if (code == "capture") {
     return "BLE capture started. The round screen now shows progress.";
   }
@@ -1711,26 +1696,6 @@ static void redirectToSettingsPage(const char *statusCode) {
   String location = String("/?status=") + statusCode;
   settingsServer.sendHeader("Location", location, true);
   settingsServer.send(303, "text/plain", "");
-}
-
-static bool looksLikeEsp32FirmwareChunk(const uint8_t *data, size_t len) {
-  if (len < 24) {
-    return false;
-  }
-
-  uint8_t magic = data[0];
-  uint8_t segmentCount = data[1];
-  uint8_t flashMode = data[2];
-  uint8_t chipIdLow = data[12];
-  uint8_t chipIdHigh = data[13];
-  uint16_t chipId = static_cast<uint16_t>(chipIdLow) |
-                    (static_cast<uint16_t>(chipIdHigh) << 8);
-
-  return magic == 0xE9 &&
-         segmentCount > 0 &&
-         segmentCount <= 16 &&
-         flashMode <= 3 &&
-         (chipId == 0 || chipId == 5);
 }
 
 static String settingsPageHtml(const String &message = "") {
@@ -1879,11 +1844,8 @@ static String settingsPageHtml(const String &message = "") {
   } else {
     html += F("<p class='hint'>No BLE capture CSV is ready yet.</p>");
   }
-  html += F("<form method='post' action='/firmware' enctype='multipart/form-data' data-working='Uploading firmware...'>");
-  html += F("<label for='firmware'>Firmware update</label><input id='firmware' name='firmware' type='file' accept='.bin,application/octet-stream'>");
-  html += F("<button class='secondary' type='submit'>Upload Firmware</button></form>");
   html += F("<button class='secondary' type='button' onclick='location.reload()'>Refresh Status</button>");
-  html += F("<p class='hint'>Leave a key field blank to keep its current value. Firmware updates must be a valid ESP32-C3 firmware.bin built for this project. The hotspot turns off after 5 minutes with no page activity.</p>");
+  html += F("<p class='hint'>Leave a key field blank to keep its current value. The hotspot turns off after 5 minutes with no page activity.</p>");
   html += F("<script>for(const f of document.forms){f.addEventListener('submit',()=>{const s=document.getElementById('status');s.hidden=false;s.textContent=f.dataset.working||'Working...';for(const b of document.querySelectorAll('button'))b.disabled=true;});}");
   html += F("function mmss(s){let m=Math.floor(s/60),r=s%60;return String(m).padStart(2,'0')+':'+String(r).padStart(2,'0')}");
   html += F("async function cap(){try{let r=await fetch('/capture-status');let j=await r.json();cap_state.textContent=j.active?'Recording '+mmss(j.remaining_s):(j.saved?'Capture ready':'No capture running');cap_detail.textContent='Packets '+j.packets+', strongest '+(j.strongest||'-')+', RSSI '+(j.rssi>-127?j.rssi+' dBm':'-');}catch(e){}}setInterval(cap,1000);cap();</script>");
@@ -2089,131 +2051,6 @@ static void handleSettingsClearKeys() {
   drawCurrentPage(true);
 }
 
-static void drawFirmwareUpdateWarning() {
-  screenAwake = true;
-  applyBacklightLevel();
-  gfx->fillScreen(0xF800);
-  gfx->fillCircle(120, 120, 118, 0xC000);
-  gfx->drawCircle(120, 120, 119, WHITE);
-  drawAaCentered(AA_FONT_SMALL, "Firmware update", 120, 36, WHITE);
-  drawAaCentered(AA_FONT_LARGE, "WAIT", 120, 64, WHITE);
-  drawAaCentered(AA_FONT_SMALL, "Do not remove", 120, 122, WHITE);
-  drawAaCentered(AA_FONT_SMALL, "power", 120, 146, WHITE);
-  drawAaCentered(AA_FONT_SMALL, "Takes 20 sec", 120, 178, WHITE);
-}
-
-static void handleFirmwareUpload() {
-  HTTPUpload &upload = settingsServer.upload();
-
-  if (upload.status == UPLOAD_FILE_START) {
-    noteSettingsServerActivity();
-    firmwareUploadFailed = false;
-    firmwareUploadFinished = false;
-    firmwareHeaderChecked = false;
-    firmwareUploadSize = 0;
-    settingsMessage = "OTA upload";
-    drawFirmwareUpdateWarning();
-    if (captureActive) {
-      cancelCapture("ota");
-    }
-    NimBLEDevice::getScan()->stop();
-    mbedtls_sha256_init(&firmwareSha);
-    firmwareHashActive = mbedtls_sha256_starts_ret(&firmwareSha, 0) == 0;
-    if (!firmwareHashActive) {
-      firmwareUploadFailed = true;
-      Serial.println("OTA SHA256 init failed");
-    }
-    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
-      firmwareUploadFailed = true;
-      Serial.printf("OTA begin failed: %s\n", Update.errorString());
-    }
-  } else if (upload.status == UPLOAD_FILE_WRITE) {
-    noteSettingsServerActivity();
-    if (!firmwareHeaderChecked) {
-      firmwareHeaderChecked = true;
-      if (!looksLikeEsp32FirmwareChunk(upload.buf, upload.currentSize)) {
-        firmwareUploadFailed = true;
-        Serial.println("OTA rejected: file does not look like ESP32 firmware");
-      }
-    }
-
-    if (!firmwareUploadFailed && firmwareHashActive &&
-        mbedtls_sha256_update_ret(&firmwareSha, upload.buf, upload.currentSize) != 0) {
-      firmwareUploadFailed = true;
-      Serial.println("OTA SHA256 update failed");
-    }
-    if (!firmwareUploadFailed &&
-        Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
-      firmwareUploadFailed = true;
-      Serial.printf("OTA write failed: %s\n", Update.errorString());
-    }
-    firmwareUploadSize += upload.currentSize;
-  } else if (upload.status == UPLOAD_FILE_END) {
-    noteSettingsServerActivity();
-    if (firmwareHashActive) {
-      if (mbedtls_sha256_finish_ret(&firmwareSha, firmwareDigest) != 0) {
-        firmwareUploadFailed = true;
-        Serial.println("OTA SHA256 finish failed");
-      }
-      mbedtls_sha256_free(&firmwareSha);
-      firmwareHashActive = false;
-    }
-    if (firmwareUploadSize == 0) {
-      firmwareUploadFailed = true;
-      Serial.println("OTA rejected: empty upload");
-    }
-
-    firmwareUploadFinished = !firmwareUploadFailed && firmwareHeaderChecked;
-    if (firmwareUploadFailed || !firmwareUploadFinished) {
-      firmwareUploadFailed = true;
-      Update.abort();
-      settingsMessage = "OTA failed";
-      Serial.printf("OTA receive failed: %s\n", Update.errorString());
-    } else {
-      settingsMessage = "Verify OTA";
-      Serial.printf("OTA received: %u bytes\n", upload.totalSize);
-    }
-  } else if (upload.status == UPLOAD_FILE_ABORTED) {
-    firmwareUploadFailed = true;
-    firmwareUploadFinished = false;
-    if (firmwareHashActive) {
-      mbedtls_sha256_free(&firmwareSha);
-      firmwareHashActive = false;
-    }
-    Update.abort();
-    settingsMessage = "OTA aborted";
-  }
-}
-
-static void handleFirmwareUpdateDone() {
-  noteSettingsServerActivity();
-  bool ok = !firmwareUploadFailed &&
-            firmwareUploadFinished &&
-            Update.end(true) &&
-            !Update.hasError();
-  if (!ok) {
-    Update.abort();
-    settingsMessage = "OTA failed";
-    Serial.printf("OTA finalise failed: %s\n", Update.errorString());
-  } else {
-    settingsMessage = "OTA complete";
-  }
-  if (ok) {
-    drawFirmwareUpdateWarning();
-  }
-  settingsServer.sendHeader("Connection", "close");
-  settingsServer.send(200,
-                      "text/html",
-                      ok ? F("<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'><body style='font-family:system-ui;background:#07151c;color:#eef;padding:22px;max-width:560px;margin:auto'><h1>Firmware updated</h1><p>ChargeScreen is restarting. Wait for the round display to return, open Settings on the device, start WiFi again, and reconnect your phone to the <strong>ChargeScreen</strong> hotspot.</p><p>Once reconnected, use the button below to reopen the setup page.</p><a href='http://192.168.4.1/' style='display:block;box-sizing:border-box;width:100%;margin-top:22px;padding:14px;background:#2fb36d;color:#04140b;text-align:center;text-decoration:none;font-weight:700'>Reload ChargeScreen setup</a></body>")
-                         : F("<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'><body style='font-family:system-ui;background:#07151c;color:#eef;padding:22px'><h1>Firmware update failed</h1><p>Upload a valid ESP32-C3 firmware.bin built for this project.</p></body>"));
-  delay(500);
-  if (ok) {
-    ESP.restart();
-  } else {
-    drawCurrentPage(true);
-  }
-}
-
 static void handleCaptureDownload() {
   noteSettingsServerActivity();
   if (!captureSaved || !LittleFS.exists(capturePath)) {
@@ -2285,7 +2122,6 @@ static void startSettingsServer() {
   settingsServer.on("/", HTTP_GET, handleSettingsRoot);
   settingsServer.on("/save", HTTP_POST, handleSettingsSave);
   settingsServer.on("/clear-keys", HTTP_POST, handleSettingsClearKeys);
-  settingsServer.on("/firmware", HTTP_POST, handleFirmwareUpdateDone, handleFirmwareUpload);
   settingsServer.on("/download-capture", HTTP_GET, handleCaptureDownload);
   settingsServer.on("/capture-status", HTTP_GET, handleCaptureStatus);
   settingsServer.on("/capture-start", HTTP_POST, handleCaptureStart);
