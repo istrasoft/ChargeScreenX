@@ -107,6 +107,19 @@ static void test_lock_expiry_with_wraparound() {
   TEST_ASSERT_FALSE(cs::lockExpired(lock, 0x100UL, 600000));
 }
 
+// The BLE task can stamp lastLockedSeenMs after the watchdog read `now`.
+static void test_lock_not_expired_when_seen_after_now() {
+  cs::DeviceLock lock;
+  cs::lockRestore(lock, "aabbccddeeff", 100005);
+  TEST_ASSERT_FALSE(cs::lockExpired(lock, 100000, 600000));
+}
+
+static void test_lock_expired_across_wraparound() {
+  cs::DeviceLock lock;
+  cs::lockRestore(lock, "aabbccddeeff", 0xFFFFFF00UL);
+  TEST_ASSERT_TRUE(cs::lockExpired(lock, 0xFFFFFF00UL + 600000UL, 600000));
+}
+
 static void test_restore_rejects_bad_value_and_clear_unlocks() {
   cs::DeviceLock lock;
   TEST_ASSERT_FALSE(cs::lockRestore(lock, "", 0));
@@ -131,6 +144,8 @@ int main(int, char **) {
   RUN_TEST(test_locked_rejects_other_addresses);
   RUN_TEST(test_note_seen_refreshes_only_locked_address);
   RUN_TEST(test_lock_expiry_with_wraparound);
+  RUN_TEST(test_lock_not_expired_when_seen_after_now);
+  RUN_TEST(test_lock_expired_across_wraparound);
   RUN_TEST(test_restore_rejects_bad_value_and_clear_unlocks);
   return UNITY_END();
 }

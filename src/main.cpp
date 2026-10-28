@@ -3398,19 +3398,23 @@ static void updateBleWatchdog() {
     restartBleScan("no Victron yet");
   }
 
-  if (victronStats.valid && lastVictronDecodeMs > 0 && now - lastVictronDecodeMs > VICTRON_SIGNAL_LOST_MS) {
+  // Signed differences: the BLE task can stamp a decode time later than `now`.
+  if (victronStats.valid && lastVictronDecodeMs > 0 &&
+      static_cast<int32_t>(now - lastVictronDecodeMs) > static_cast<int32_t>(VICTRON_SIGNAL_LOST_MS)) {
     victronStats.valid = false;
     victronStats.error = "signal lost";
     drawCurrentPage(true);
   }
 
-  if (solarStats.valid && lastSolarDecodeMs > 0 && now - lastSolarDecodeMs > VICTRON_SIGNAL_LOST_MS) {
+  if (solarStats.valid && lastSolarDecodeMs > 0 &&
+      static_cast<int32_t>(now - lastSolarDecodeMs) > static_cast<int32_t>(VICTRON_SIGNAL_LOST_MS)) {
     solarStats.valid = false;
     solarStats.error = "signal lost";
     drawCurrentPage(true);
   }
 
-  if (orionStats.valid && lastOrionDecodeMs > 0 && now - lastOrionDecodeMs > VICTRON_SIGNAL_LOST_MS) {
+  if (orionStats.valid && lastOrionDecodeMs > 0 &&
+      static_cast<int32_t>(now - lastOrionDecodeMs) > static_cast<int32_t>(VICTRON_SIGNAL_LOST_MS)) {
     orionStats.valid = false;
     orionStats.error = "signal lost";
     drawCurrentPage(true);

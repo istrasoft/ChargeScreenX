@@ -126,8 +126,11 @@ inline bool lockNoteGoodDecode(DeviceLock &lock, const char *mac, uint32_t now) 
   return true;
 }
 
+// Signed difference: a lastLockedSeenMs stamped by the BLE task after `now`
+// was read counts as "just seen", not as ~49 days ago. Wrap-safe up to 24.8 days.
 inline bool lockExpired(const DeviceLock &lock, uint32_t now, uint32_t releaseMs) {
-  return lockIsLocked(lock) && static_cast<uint32_t>(now - lock.lastLockedSeenMs) >= releaseMs;
+  return lockIsLocked(lock) &&
+         static_cast<int32_t>(now - lock.lastLockedSeenMs) >= static_cast<int32_t>(releaseMs);
 }
 
 inline void lockClear(DeviceLock &lock) {

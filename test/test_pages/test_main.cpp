@@ -58,6 +58,7 @@ static void test_cycle_due() {
   TEST_ASSERT_FALSE(cs::cycleDue(20000, 0, 15000, 10));
   TEST_ASSERT_TRUE(cs::cycleDue(10000, 0, 0, 10));
   TEST_ASSERT_FALSE(cs::cycleDue(0x100UL, 0xFFFFFF00UL, 0xFFFFFF00UL, 10));
+  TEST_ASSERT_TRUE(cs::cycleDue(0x3000UL, 0xFFFFFF00UL, 0xFFFFFF00UL, 10));
 }
 
 int main(int, char **) {
