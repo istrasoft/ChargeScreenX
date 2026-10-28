@@ -3415,7 +3415,7 @@ static void updateBleWatchdog() {
     Serial.println("BLE scan was stopped; restarting");
     restartBleScan("stopped");
   } else if (lastVictronAdvertMs > 0 &&
-             now - lastVictronAdvertMs > VICTRON_QUIET_RESTART_MS &&
+             static_cast<int32_t>(now - lastVictronAdvertMs) > static_cast<int32_t>(VICTRON_QUIET_RESTART_MS) &&
              now - lastBleScanStartMs > VICTRON_QUIET_RESTART_MS) {
     restartBleScan("Victron quiet");
   } else if (lastVictronAdvertMs == 0 &&
