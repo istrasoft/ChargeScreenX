@@ -64,6 +64,7 @@ static constexpr uint32_t VICTRON_QUIET_RESTART_MS = 6000;
 static constexpr uint32_t VICTRON_SIGNAL_LOST_MS = 25000;
 static constexpr uint32_t BLE_NEVER_SEEN_RESTART_MS = 15000;
 static constexpr uint32_t SETTINGS_SERVER_IDLE_MS = 300000;
+static constexpr uint32_t VICTRON_LOCK_RELEASE_MS = 600000;
 static constexpr bool DEMO_MODE = false;
 static constexpr int16_t GAUGE_CENTER_X = 120;
 static constexpr int16_t GAUGE_CENTER_Y = 120;
@@ -161,6 +162,8 @@ BleSeen solarSeen;
 BleSeen ecoSeen;
 BatteryStats victronStats;
 SolarStats solarStats;
+static cs::DeviceLock shuntLock;
+static cs::DeviceLock solarLock;
 static bool gaugeFaceDrawn = false;
 static bool gaugeValuesDrawn = false;
 static int lastSocDisplay = -1;
@@ -402,26 +405,6 @@ static bool isVictronInstantReadout(const std::string &manufacturerData) {
          advertisementType == VICTRON_PRODUCT_ADVERTISEMENT;
 }
 
-static String normaliseAddress(const String &address) {
-  String normalised;
-  normalised.reserve(address.length());
-  for (size_t i = 0; i < address.length(); i++) {
-    char c = address[i];
-    if (isxdigit(c)) {
-      normalised += static_cast<char>(tolower(c));
-    }
-  }
-  return normalised;
-}
-
-static bool matchesConfiguredVictronAddress(const String &address) {
-  return true;
-}
-
-static bool matchesConfiguredSolarAddress(const String &address) {
-  return true;
-}
-
 static bool hexToBytes(const char *hex, uint8_t *out, size_t outLen) {
   if (strlen(hex) != outLen * 2) {
     return false;
@@ -563,6 +546,8 @@ static void loadStoredSecrets() {
   storedVictronKey = secrets.getString("shunt_key", "");
   storedSolarKey = secrets.getString("solar_key", "");
   storedEcoWorthyPassword = secrets.getString("eco_key", "");
+  cs::lockRestore(shuntLock, secrets.getString("shunt_mac", "").c_str(), millis());
+  cs::lockRestore(solarLock, secrets.getString("solar_mac", "").c_str(), millis());
   demoModeEnabled = secrets.getBool("demo_mode", DEMO_MODE);
   ecoWorthyBatteryMode = secrets.getBool("battery_eco", false);
   showValueLabels = secrets.getBool("value_labels", true);
@@ -707,12 +692,9 @@ static bool decryptVictronPayload(const uint8_t *payload,
   return true;
 }
 
-static bool decodeVictronBatteryMonitor(const std::string &manufacturerData) {
-  victronStats.error = "";
-
+static bool decodeVictronBatteryMonitor(const std::string &manufacturerData, BatteryStats &out, String &error) {
   if (manufacturerData.size() < 11) {
-    victronStats.valid = false;
-    victronStats.error = "short advert";
+    error = "short advert";
     return false;
   }
 
@@ -721,70 +703,58 @@ static bool decodeVictronBatteryMonitor(const std::string &manufacturerData) {
   size_t payloadLen = manufacturerData.size() - 2;
 
   if (payloadLen < 9 || payload[0] != VICTRON_PRODUCT_ADVERTISEMENT) {
-    victronStats.valid = false;
-    victronStats.error = "not instant";
+    error = "not instant";
     return false;
   }
 
   if (payload[4] != VICTRON_BATTERY_MONITOR_RECORD) {
-    victronStats.valid = false;
-    victronStats.error = "not shunt record";
+    error = "not shunt record";
     return false;
   }
 
   uint8_t plain[24] = {};
   size_t encryptedLen = sizeof(plain);
 
-  if (!decryptVictronPayload(payload,
-                             payloadLen,
-                             activeVictronKey(),
-                             plain,
-                             encryptedLen,
-                             victronStats.error)) {
-    victronStats.valid = false;
+  if (!decryptVictronPayload(payload, payloadLen, activeVictronKey(), plain, encryptedLen, error)) {
     return false;
   }
 
   if (encryptedLen < 14) {
-    victronStats.valid = false;
-    victronStats.error = "short data";
+    error = "short data";
     return false;
   }
 
   int32_t currentRaw = signExtend(readBits(plain, encryptedLen, 66, 22), 22);
   uint32_t consumedRaw = readBits(plain, encryptedLen, 88, 20);
 
-  victronStats.timeToGoMinutes = readBits(plain, encryptedLen, 0, 16);
-  victronStats.voltage = static_cast<int16_t>(readBits(plain, encryptedLen, 16, 16)) * 0.01f;
-  victronStats.alarmReason = readBits(plain, encryptedLen, 32, 16);
-  victronStats.auxValue = static_cast<int16_t>(readBits(plain, encryptedLen, 48, 16)) * 0.01f;
-  victronStats.auxMode = readBits(plain, encryptedLen, 64, 2);
-  victronStats.current = currentRaw * 0.001f;
-  victronStats.power = victronStats.voltage * victronStats.current;
-  victronStats.consumedAh = consumedRaw == 0xFFFFF ? NAN : -static_cast<float>(consumedRaw) * 0.1f;
-  victronStats.soc = readBits(plain, encryptedLen, 108, 10) * 0.1f;
-  victronStats.valid = true;
-  victronStats.error = "";
-  lastVictronDecodeMs = millis();
+  out = BatteryStats();
+  out.timeToGoMinutes = readBits(plain, encryptedLen, 0, 16);
+  out.voltage = static_cast<int16_t>(readBits(plain, encryptedLen, 16, 16)) * 0.01f;
+  out.alarmReason = readBits(plain, encryptedLen, 32, 16);
+  out.auxValue = static_cast<int16_t>(readBits(plain, encryptedLen, 48, 16)) * 0.01f;
+  out.auxMode = readBits(plain, encryptedLen, 64, 2);
+  out.current = currentRaw * 0.001f;
+  out.power = out.voltage * out.current;
+  out.consumedAh = consumedRaw == 0xFFFFF ? NAN : -static_cast<float>(consumedRaw) * 0.1f;
+  out.soc = readBits(plain, encryptedLen, 108, 10) * 0.1f;
+  out.valid = true;
+  out.error = "";
 
   Serial.printf("Victron decoded V=%.2fV I=%.3fA P=%.0fW consumed=%.1fAh soc=%.1f%% auxMode=%u aux=%.2f alarm=0x%04X\n",
-                victronStats.voltage,
-                victronStats.current,
-                victronStats.power,
-                victronStats.consumedAh,
-                victronStats.soc,
-                victronStats.auxMode,
-                victronStats.auxValue,
-                victronStats.alarmReason);
+                out.voltage,
+                out.current,
+                out.power,
+                out.consumedAh,
+                out.soc,
+                out.auxMode,
+                out.auxValue,
+                out.alarmReason);
   return true;
 }
 
-static bool decodeVictronSolarCharger(const std::string &manufacturerData) {
-  solarStats.error = "";
-
+static bool decodeVictronSolarCharger(const std::string &manufacturerData, SolarStats &out, String &error) {
   if (manufacturerData.size() < 11) {
-    solarStats.valid = false;
-    solarStats.error = "short advert";
+    error = "short advert";
     return false;
   }
 
@@ -793,33 +763,24 @@ static bool decodeVictronSolarCharger(const std::string &manufacturerData) {
   size_t payloadLen = manufacturerData.size() - 2;
 
   if (payloadLen < 9 || payload[0] != VICTRON_PRODUCT_ADVERTISEMENT) {
-    solarStats.valid = false;
-    solarStats.error = "not instant";
+    error = "not instant";
     return false;
   }
 
   if (payload[4] != VICTRON_SOLAR_CHARGER_RECORD) {
-    solarStats.valid = false;
-    solarStats.error = "not solar record";
+    error = "not solar record";
     return false;
   }
 
   uint8_t plain[16] = {};
   size_t encryptedLen = sizeof(plain);
 
-  if (!decryptVictronPayload(payload,
-                             payloadLen,
-                             activeSolarKey(),
-                             plain,
-                             encryptedLen,
-                             solarStats.error)) {
-    solarStats.valid = false;
+  if (!decryptVictronPayload(payload, payloadLen, activeSolarKey(), plain, encryptedLen, error)) {
     return false;
   }
 
   if (encryptedLen < 12) {
-    solarStats.valid = false;
-    solarStats.error = "short data";
+    error = "short data";
     return false;
   }
 
@@ -831,44 +792,35 @@ static bool decodeVictronSolarCharger(const std::string &manufacturerData) {
       !readLeU16(plain, encryptedLen, 4, batteryCurrentRaw) ||
       !readLeU16(plain, encryptedLen, 6, yieldRaw) ||
       !readLeU16(plain, encryptedLen, 8, pvPowerRaw)) {
-    solarStats.valid = false;
-    solarStats.error = "short data";
+    error = "short data";
     return false;
   }
   uint16_t loadCurrentRaw = readBits(plain, encryptedLen, 80, 9);
 
-  solarStats.deviceState = plain[0];
-  solarStats.errorCode = plain[1];
-  solarStats.batteryVoltage = batteryVoltageRaw == 0x7FFF
-                                  ? NAN
-                                  : static_cast<int16_t>(batteryVoltageRaw) * 0.01f;
-  solarStats.batteryCurrent = batteryCurrentRaw == 0x7FFF
-                                  ? NAN
-                                  : static_cast<int16_t>(batteryCurrentRaw) * 0.1f;
-  solarStats.yieldTodayKwh = yieldRaw == 0xFFFF ? NAN : yieldRaw * 0.01f;
-  solarStats.pvPower = pvPowerRaw == 0xFFFF ? NAN : static_cast<float>(pvPowerRaw);
-  solarStats.loadCurrent = loadCurrentRaw == 0x1FF ? NAN : loadCurrentRaw * 0.1f;
-  solarStats.valid = true;
-  solarStats.error = "";
-  lastSolarDecodeMs = millis();
+  out = SolarStats();
+  out.deviceState = plain[0];
+  out.errorCode = plain[1];
+  out.batteryVoltage = batteryVoltageRaw == 0x7FFF
+                           ? NAN
+                           : static_cast<int16_t>(batteryVoltageRaw) * 0.01f;
+  out.batteryCurrent = batteryCurrentRaw == 0x7FFF
+                           ? NAN
+                           : static_cast<int16_t>(batteryCurrentRaw) * 0.1f;
+  out.yieldTodayKwh = yieldRaw == 0xFFFF ? NAN : yieldRaw * 0.01f;
+  out.pvPower = pvPowerRaw == 0xFFFF ? NAN : static_cast<float>(pvPowerRaw);
+  out.loadCurrent = loadCurrentRaw == 0x1FF ? NAN : loadCurrentRaw * 0.1f;
+  out.valid = true;
+  out.error = "";
 
   logDecryptedBytes("Victron solar", plain, encryptedLen);
-  Serial.printf("Victron solar raw state=%u err=%u V=0x%04X I=0x%04X yield=0x%04X PV=0x%04X load=0x%03X\n",
-                solarStats.deviceState,
-                solarStats.errorCode,
-                batteryVoltageRaw,
-                batteryCurrentRaw,
-                yieldRaw,
-                pvPowerRaw,
-                loadCurrentRaw);
   Serial.printf("Victron solar decoded state=%u err=%u V=%.2fV I=%.1fA PV=%.0fW yield=%.2fkWh load=%.1fA\n",
-                solarStats.deviceState,
-                solarStats.errorCode,
-                solarStats.batteryVoltage,
-                solarStats.batteryCurrent,
-                solarStats.pvPower,
-                solarStats.yieldTodayKwh,
-                solarStats.loadCurrent);
+                out.deviceState,
+                out.errorCode,
+                out.batteryVoltage,
+                out.batteryCurrent,
+                out.pvPower,
+                out.yieldTodayKwh,
+                out.loadCurrent);
   return true;
 }
 
@@ -1479,6 +1431,115 @@ static void restartBleScan(const char *reason) {
   lastBleScanStartMs = millis();
 }
 
+static void releaseVictronLock(cs::DeviceLock &lock, const char *nvsKey, const char *kind, const char *reason) {
+  bool wasLocked = cs::lockIsLocked(lock);
+  cs::lockClear(lock);
+  secrets.remove(nvsKey);
+  if (wasLocked) {
+    Serial.printf("Victron %s lock released (%s)\n", kind, reason);
+  }
+}
+
+static String lockStatusText(const cs::DeviceLock &lock) {
+  if (!cs::lockIsLocked(lock)) {
+    return "Searching";
+  }
+  char mac[18];
+  cs::formatMac(lock.locked, mac);
+  return String("Locked to ") + mac;
+}
+
+static void noteVictronGoodDecode(cs::DeviceLock &lock,
+                                  const char *nvsKey,
+                                  const char *kind,
+                                  const char *mac,
+                                  const String &address) {
+  if (cs::lockNoteGoodDecode(lock, mac, millis())) {
+    secrets.putString(nvsKey, mac);
+    Serial.printf("Victron %s locked to %s\n", kind, address.c_str());
+  }
+}
+
+static void handleShuntAdvert(const String &name,
+                              const String &address,
+                              const char *mac,
+                              int rssi,
+                              const std::string &manufacturerData) {
+  if (!cs::lockAccepts(shuntLock, mac)) {
+    return;
+  }
+
+  uint32_t now = millis();
+  cs::lockNoteSeen(shuntLock, mac, now);
+  victronSeen.name = name.length() ? name : "Victron";
+  victronSeen.address = address;
+  victronSeen.rssi = rssi;
+  victronSeen.seenMs = now;
+  lastVictronAdvertMs = now;
+
+  BatteryStats decoded;
+  String error;
+  bool ok = decodeVictronBatteryMonitor(manufacturerData, decoded, error);
+  if (ok && !cs::plausibleShunt(decoded.voltage, decoded.soc)) {
+    ok = false;
+    error = "implausible";
+  }
+
+  if (ok) {
+    victronStats = decoded;
+    lastVictronDecodeMs = now;
+    noteVictronGoodDecode(shuntLock, "shunt_mac", "shunt", mac, address);
+  } else if (!victronStats.valid) {
+    victronStats.error = error;
+  }
+
+  Serial.printf("Victron shunt %s RSSI %d %s data %s\n",
+                address.c_str(),
+                rssi,
+                ok ? "decoded" : error.c_str(),
+                bytesToHex(manufacturerData).c_str());
+}
+
+static void handleSolarAdvert(const String &name,
+                              const String &address,
+                              const char *mac,
+                              int rssi,
+                              const std::string &manufacturerData) {
+  if (!cs::lockAccepts(solarLock, mac)) {
+    return;
+  }
+
+  uint32_t now = millis();
+  cs::lockNoteSeen(solarLock, mac, now);
+  solarSeen.name = name.length() ? name : "SmartSolar";
+  solarSeen.address = address;
+  solarSeen.rssi = rssi;
+  solarSeen.seenMs = now;
+  lastSolarAdvertMs = now;
+
+  SolarStats decoded;
+  String error;
+  bool ok = decodeVictronSolarCharger(manufacturerData, decoded, error);
+  if (ok && !cs::plausibleOptionalVoltage(decoded.batteryVoltage)) {
+    ok = false;
+    error = "implausible";
+  }
+
+  if (ok) {
+    solarStats = decoded;
+    lastSolarDecodeMs = now;
+    noteVictronGoodDecode(solarLock, "solar_mac", "solar", mac, address);
+  } else if (!solarStats.valid) {
+    solarStats.error = error;
+  }
+
+  Serial.printf("Victron solar %s RSSI %d %s data %s\n",
+                address.c_str(),
+                rssi,
+                ok ? "decoded" : error.c_str(),
+                bytesToHex(manufacturerData).c_str());
+}
+
 class ScanCallbacks : public NimBLEScanCallbacks {
   void onResult(const NimBLEAdvertisedDevice *device) override {
     if (captureActive) {
@@ -1495,35 +1556,13 @@ class ScanCallbacks : public NimBLEScanCallbacks {
       if (isVictronInstantReadout(manufacturerData)) {
         const uint8_t *data = reinterpret_cast<const uint8_t *>(manufacturerData.data());
         uint8_t recordType = manufacturerData.size() > 6 ? data[6] : 0xFF;
-
-        if (recordType == VICTRON_BATTERY_MONITOR_RECORD &&
-            matchesConfiguredVictronAddress(address)) {
-          victronSeen.name = name.length() ? name : "Victron";
-          victronSeen.address = address;
-          victronSeen.rssi = rssi;
-          victronSeen.seenMs = millis();
-          lastVictronAdvertMs = victronSeen.seenMs;
-          bool decoded = decodeVictronBatteryMonitor(manufacturerData);
-
-          Serial.printf("Victron shunt %s RSSI %d %s data %s\n",
-                        address.c_str(),
-                        rssi,
-                        decoded ? "decoded" : victronStats.error.c_str(),
-                        bytesToHex(manufacturerData).c_str());
-        } else if (recordType == VICTRON_SOLAR_CHARGER_RECORD &&
-                   matchesConfiguredSolarAddress(address)) {
-          solarSeen.name = name.length() ? name : "SmartSolar";
-          solarSeen.address = address;
-          solarSeen.rssi = rssi;
-          solarSeen.seenMs = millis();
-          lastSolarAdvertMs = solarSeen.seenMs;
-          bool decoded = decodeVictronSolarCharger(manufacturerData);
-
-          Serial.printf("Victron solar %s RSSI %d %s data %s\n",
-                        address.c_str(),
-                        rssi,
-                        decoded ? "decoded" : solarStats.error.c_str(),
-                        bytesToHex(manufacturerData).c_str());
+        char mac[13];
+        if (cs::normaliseMac(address.c_str(), mac)) {
+          if (recordType == VICTRON_BATTERY_MONITOR_RECORD) {
+            handleShuntAdvert(name, address, mac, rssi, manufacturerData);
+          } else if (recordType == VICTRON_SOLAR_CHARGER_RECORD) {
+            handleSolarAdvert(name, address, mac, rssi, manufacturerData);
+          }
         }
       }
     }
@@ -1720,6 +1759,11 @@ static String settingsPageHtml(const String &message = "") {
   html += F("<label for='solar_key'>Solar controller key</label><input id='solar_key' name='solar_key' autocomplete='off' placeholder='");
   html += maskedKeyText(storedSolarKey);
   html += F("'>");
+  html += F("<p class='hint'>Battery monitor: ");
+  html += lockStatusText(shuntLock);
+  html += F("<br>Solar controller: ");
+  html += lockStatusText(solarLock);
+  html += F("</p>");
   html += F("<h2>Eco-Worthy</h2>");
   html += F("<p class='hint'>Eco-Worthy/JBD support is not working yet. These settings are here for testing future compatibility. Batteries commonly use password 123123.</p>");
   html += F("<label for='eco_key'>Eco-Worthy/JBD battery password</label><input id='eco_key' name='eco_key' autocomplete='off' placeholder='");
@@ -1866,6 +1910,9 @@ static void handleSettingsSave() {
 
   if (shuntKey.length()) {
     if (isValidKeyHex(shuntKey)) {
+      if (shuntKey != storedVictronKey) {
+        releaseVictronLock(shuntLock, "shunt_mac", "shunt", "key changed");
+      }
       storedVictronKey = shuntKey;
       secrets.putString("shunt_key", storedVictronKey);
       saved = true;
@@ -1876,6 +1923,9 @@ static void handleSettingsSave() {
 
   if (solarKey.length()) {
     if (isValidKeyHex(solarKey)) {
+      if (solarKey != storedSolarKey) {
+        releaseVictronLock(solarLock, "solar_mac", "solar", "key changed");
+      }
       storedSolarKey = solarKey;
       secrets.putString("solar_key", storedSolarKey);
       saved = true;
@@ -2025,6 +2075,8 @@ static void handleSettingsClearKeys() {
   secrets.remove("shunt_key");
   secrets.remove("solar_key");
   secrets.remove("eco_key");
+  releaseVictronLock(shuntLock, "shunt_mac", "shunt", "keys cleared");
+  releaseVictronLock(solarLock, "solar_mac", "solar", "keys cleared");
   if (!demoModeEnabled) {
     victronStats.valid = false;
     solarStats.valid = false;
@@ -2997,6 +3049,14 @@ static void updateBleWatchdog() {
     solarStats.valid = false;
     solarStats.error = "signal lost";
     drawCurrentPage(true);
+  }
+
+  if (cs::lockExpired(shuntLock, now, VICTRON_LOCK_RELEASE_MS)) {
+    releaseVictronLock(shuntLock, "shunt_mac", "shunt", "not seen for 10 min");
+  }
+
+  if (cs::lockExpired(solarLock, now, VICTRON_LOCK_RELEASE_MS)) {
+    releaseVictronLock(solarLock, "solar_mac", "solar", "not seen for 10 min");
   }
 
   if (demoModeEnabled) {
