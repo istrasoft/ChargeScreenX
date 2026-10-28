@@ -40,7 +40,7 @@ static constexpr int PIN_TOUCH_SDA = 4;
 static constexpr int PIN_TOUCH_SCL = 5;
 static constexpr int PIN_TOUCH_INT = 0;
 static constexpr int PIN_TOUCH_RST = 1;
-static constexpr uint8_t PAGE_COUNT = 2;
+static constexpr uint8_t PAGE_COUNT = 3;
 static constexpr uint32_t CAPTURE_DURATION_MS = 5UL * 60UL * 1000UL;
 static constexpr size_t CSV_FLUSH_EVERY_ROWS = 20;
 
@@ -61,6 +61,12 @@ static constexpr uint16_t COLOR_SOLAR_TRACK = 0x5B23;
 static constexpr uint16_t COLOR_SOLAR_ORANGE = 0xEC83;
 static constexpr uint16_t COLOR_SOLAR_TEXT = 0xFFBD;
 static constexpr uint16_t COLOR_SOLAR_DIM_TEXT = 0xD6AB;
+static constexpr uint16_t COLOR_ORION_PANEL = 0x2887;
+static constexpr uint16_t COLOR_ORION_TRACK = 0x598F;
+static constexpr uint16_t COLOR_ORION_ARC = 0xB37F;
+static constexpr uint16_t COLOR_ORION_TEXT = 0xF75F;
+static constexpr uint16_t COLOR_ORION_DIM_TEXT = 0xCDBC;
+static constexpr float ORION_FULL_SCALE_AMPS = 50.0f;
 static constexpr uint32_t VICTRON_QUIET_RESTART_MS = 6000;
 static constexpr uint32_t VICTRON_SIGNAL_LOST_MS = 25000;
 static constexpr uint32_t BLE_NEVER_SEEN_RESTART_MS = 15000;
@@ -198,6 +204,14 @@ static String lastSolarCurrentText;
 static String lastSolarYieldText;
 static String lastSolarLoadText;
 static String lastSolarErrorText;
+static bool orionPageDrawn = false;
+static String lastOrionCurrentText;
+static String lastOrionInputVoltageText;
+static String lastOrionOutputVoltageText;
+static String lastOrionInputCurrentText;
+static String lastOrionPowerText;
+static String lastOrionStatusText;
+static String lastOrionErrorText;
 static uint32_t lastVictronAdvertMs = 0;
 static uint32_t lastVictronDecodeMs = 0;
 static uint32_t lastSolarAdvertMs = 0;
@@ -244,6 +258,10 @@ static float demoSolarPvPower = 268.0f;
 static float demoSolarBatteryVoltage = 14.42f;
 static float demoSolarChargeCurrent = 18.6f;
 static float demoSolarYieldKwh = 1.27f;
+static float demoOrionOutputCurrent = 32.0f;
+static float demoOrionOutputVoltage = 14.2f;
+static float demoOrionInputVoltage = 13.4f;
+static float demoOrionInputCurrent = 35.5f;
 static uint16_t solarArrayWatts = DEFAULT_SOLAR_ARRAY_WATTS;
 static uint16_t cycleSeconds = 0;
 static uint32_t lastPageChangeMs = 0;
@@ -603,6 +621,10 @@ static void loadStoredSecrets() {
   demoSolarBatteryVoltage = secrets.getFloat("demo_svolt", 14.42f);
   demoSolarChargeCurrent = secrets.getFloat("demo_scurr", 18.6f);
   demoSolarYieldKwh = secrets.getFloat("demo_yield", 1.27f);
+  demoOrionOutputCurrent = secrets.getFloat("demo_oa", 32.0f);
+  demoOrionOutputVoltage = secrets.getFloat("demo_ov", 14.2f);
+  demoOrionInputVoltage = secrets.getFloat("demo_iv", 13.4f);
+  demoOrionInputCurrent = secrets.getFloat("demo_ia", 35.5f);
   screenTimeoutSeconds = secrets.getUShort("screen_timeout", DEFAULT_SCREEN_TIMEOUT_SECONDS);
   uint16_t sanitisedTimeoutSeconds = sanitiseScreenTimeoutSeconds(screenTimeoutSeconds);
   if (sanitisedTimeoutSeconds != screenTimeoutSeconds) {
@@ -977,7 +999,12 @@ static int16_t aaTextWidth(const AaFont &font, const String &text) {
   return width;
 }
 
-static void drawAaText(const AaFont &font, const String &text, int16_t x, int16_t y, uint16_t color) {
+static void drawAaText(const AaFont &font,
+                       const String &text,
+                       int16_t x,
+                       int16_t y,
+                       uint16_t color,
+                       uint16_t background = COLOR_PANEL_BLUE) {
   int16_t cursorX = x;
   AaGlyph glyph;
   for (size_t i = 0; i < text.length(); i++) {
@@ -993,16 +1020,21 @@ static void drawAaText(const AaFont &font, const String &text, int16_t x, int16_
         }
         gfx->drawPixel(cursorX + glyph.xOffset + px,
                        y + glyph.yOffset + py,
-                       blend565(color, COLOR_PANEL_BLUE, alpha));
+                       blend565(color, background, alpha));
       }
     }
     cursorX += glyph.xAdvance;
   }
 }
 
-static void drawAaCentered(const AaFont &font, const String &text, int16_t centerX, int16_t topY, uint16_t color) {
+static void drawAaCentered(const AaFont &font,
+                           const String &text,
+                           int16_t centerX,
+                           int16_t topY,
+                           uint16_t color,
+                           uint16_t background = COLOR_PANEL_BLUE) {
   int16_t width = aaTextWidth(font, text);
-  drawAaText(font, text, centerX - width / 2, topY, color);
+  drawAaText(font, text, centerX - width / 2, topY, color, background);
 }
 
 static bool touchReadBytes(uint8_t reg, uint8_t *buffer, size_t len) {
@@ -1090,6 +1122,7 @@ static void invalidateScreens() {
   gaugeValuesDrawn = false;
   pageTwoDrawn = false;
   solarValuesDrawn = false;
+  orionPageDrawn = false;
   capturePageDrawn = false;
   settingsPageDrawn = false;
 }
@@ -1235,6 +1268,55 @@ static String displaySolarStatusText(const SolarStats &stats) {
 
   if (stats.errorCode != 0 && stats.errorCode != 0xFF) {
     return String("Error ") + String(stats.errorCode);
+  }
+
+  return cs::chargerStateText(stats.deviceState);
+}
+
+static OrionStats displayOrionStats() {
+  if (!demoModeEnabled) {
+    return orionStats;
+  }
+
+  OrionStats stats;
+  stats.valid = true;
+  stats.deviceState = 3;
+  stats.errorCode = 0;
+  stats.outputVoltage = demoOrionOutputVoltage;
+  stats.outputCurrent = demoOrionOutputCurrent;
+  stats.inputVoltage = demoOrionInputVoltage;
+  stats.inputCurrent = demoOrionInputCurrent;
+  stats.offReason = 0;
+  stats.error = "";
+  return stats;
+}
+
+static String displayOrionStatusText(const OrionStats &stats) {
+  if (demoModeEnabled) {
+    return "Demo Orion";
+  }
+
+  if (!stats.valid) {
+    if (!storedOrionKey.length()) {
+      return "Add key via WiFi";
+    }
+    if (lastOrionAdvertMs > 0 && millis() - lastOrionAdvertMs < 10000) {
+      return "Decode error";
+    }
+    return "Searching";
+  }
+
+  if (millis() - lastOrionDecodeMs > 10000) {
+    return "Signal lost";
+  }
+
+  if (stats.errorCode != 0 && stats.errorCode != 0xFF) {
+    return String("Error ") + String(stats.errorCode);
+  }
+
+  if (stats.deviceState == 0) {
+    const char *reason = cs::orionOffReasonText(stats.offReason);
+    return reason ? reason : "Off";
   }
 
   return cs::chargerStateText(stats.deviceState);
@@ -1961,6 +2043,14 @@ static String settingsPageHtml(const String &message = "") {
   html += String(demoSolarChargeCurrent, 1);
   html += F("'><input id='demo_yield' name='demo_yield' type='number' step='0.01' value='");
   html += String(demoSolarYieldKwh, 2);
+  html += F("'><label for='demo_orion_a'>Orion out A</label><label for='demo_orion_ov'>Orion out V</label><input id='demo_orion_a' name='demo_orion_a' type='number' step='0.1' value='");
+  html += String(demoOrionOutputCurrent, 1);
+  html += F("'><input id='demo_orion_ov' name='demo_orion_ov' type='number' step='0.1' value='");
+  html += String(demoOrionOutputVoltage, 1);
+  html += F("'><label for='demo_orion_iv'>Orion in V</label><label for='demo_orion_ia'>Orion in A</label><input id='demo_orion_iv' name='demo_orion_iv' type='number' step='0.1' value='");
+  html += String(demoOrionInputVoltage, 1);
+  html += F("'><input id='demo_orion_ia' name='demo_orion_ia' type='number' step='0.1' value='");
+  html += String(demoOrionInputCurrent, 1);
   html += F("'></div>");
   html += F("<button type='submit'>Save Settings</button></form>");
   html += F("<form method='post' action='/clear-keys' data-working='Clearing keys...'>");
@@ -2140,6 +2230,7 @@ static void handleSettingsSave() {
     secrets.putBool("demo_mode", demoModeEnabled);
     victronStats.valid = false;
     solarStats.valid = false;
+    orionStats.valid = false;
   }
   saved = true;
 
@@ -2188,6 +2279,10 @@ static void handleSettingsSave() {
   demoSolarBatteryVoltage = constrain(settingsServer.arg("demo_solar_v").toFloat(), 0.0f, 80.0f);
   demoSolarChargeCurrent = constrain(settingsServer.arg("demo_solar_a").toFloat(), 0.0f, 300.0f);
   demoSolarYieldKwh = constrain(settingsServer.arg("demo_yield").toFloat(), 0.0f, 99.0f);
+  demoOrionOutputCurrent = constrain(settingsServer.arg("demo_orion_a").toFloat(), 0.0f, 100.0f);
+  demoOrionOutputVoltage = constrain(settingsServer.arg("demo_orion_ov").toFloat(), 0.0f, 80.0f);
+  demoOrionInputVoltage = constrain(settingsServer.arg("demo_orion_iv").toFloat(), 0.0f, 80.0f);
+  demoOrionInputCurrent = constrain(settingsServer.arg("demo_orion_ia").toFloat(), 0.0f, 100.0f);
   secrets.putFloat("demo_soc", demoBatterySoc);
   secrets.putFloat("demo_volt", demoBatteryVoltage);
   secrets.putFloat("demo_curr", demoBatteryCurrent);
@@ -2196,6 +2291,10 @@ static void handleSettingsSave() {
   secrets.putFloat("demo_svolt", demoSolarBatteryVoltage);
   secrets.putFloat("demo_scurr", demoSolarChargeCurrent);
   secrets.putFloat("demo_yield", demoSolarYieldKwh);
+  secrets.putFloat("demo_oa", demoOrionOutputCurrent);
+  secrets.putFloat("demo_ov", demoOrionOutputVoltage);
+  secrets.putFloat("demo_iv", demoOrionInputVoltage);
+  secrets.putFloat("demo_ia", demoOrionInputCurrent);
   saved = true;
 
   if (invalid) {
@@ -2665,6 +2764,91 @@ static void drawPageTwo(bool force = false) {
   solarValuesDrawn = true;
 }
 
+static void drawOrionPage(bool force = false) {
+  OrionStats stats = displayOrionStats();
+  String statusText = displayOrionStatusText(stats);
+  float outputPower = isnan(stats.outputVoltage) || isnan(stats.outputCurrent)
+                          ? NAN
+                          : stats.outputVoltage * stats.outputCurrent;
+  String currentText = stats.valid ? formatOneDecimalOrDash(stats.outputCurrent, "A") : "";
+  String inputVoltageText = stats.valid ? formatOneDecimalOrDash(stats.inputVoltage, "V") : "";
+  String outputVoltageText = stats.valid ? formatOneDecimalOrDash(stats.outputVoltage, "V") : "";
+  String inputCurrentText = stats.valid ? formatOneDecimalOrDash(stats.inputCurrent, "A") : "";
+  String powerText = stats.valid ? formatWattsOrDash(outputPower) : "";
+  String errorText = stats.valid ? "" : (!storedOrionKey.length()
+                                             ? "add key via WiFi"
+                                             : (orionStats.error.length() ? orionStats.error : "no Orion BLE"));
+
+  bool changed = force || !orionPageDrawn ||
+                 currentText != lastOrionCurrentText ||
+                 inputVoltageText != lastOrionInputVoltageText ||
+                 outputVoltageText != lastOrionOutputVoltageText ||
+                 inputCurrentText != lastOrionInputCurrentText ||
+                 powerText != lastOrionPowerText ||
+                 statusText != lastOrionStatusText ||
+                 errorText != lastOrionErrorText;
+  if (!changed) {
+    return;
+  }
+
+  float ringCurrent = stats.valid && !isnan(stats.outputCurrent)
+                          ? constrain(stats.outputCurrent, 0.0f, ORION_FULL_SCALE_AMPS)
+                          : 0.0f;
+
+  gfx->fillScreen(COLOR_BLACK_SOFT);
+  gfx->fillCircle(120, 120, 120, COLOR_ORION_PANEL);
+  drawSegmentedGaugeArcAt(120,
+                          GAUGE_ARC_SWEEP_DEG * ringCurrent / ORION_FULL_SCALE_AMPS,
+                          COLOR_ORION_TRACK,
+                          COLOR_ORION_ARC,
+                          COLOR_ORION_PANEL);
+  gfx->fillCircle(120, 120, GAUGE_CLEAR_RADIUS, COLOR_ORION_PANEL);
+
+  if (stats.valid) {
+    if (showValueGrid) {
+      gfx->drawFastVLine(120, 106, 72, COLOR_ORION_TRACK);
+      gfx->drawFastHLine(120 - 67, 144, 134, COLOR_ORION_TRACK);
+    }
+    if (showValueLabels) {
+      drawTinyLabel("CHARGE", 120, 42, COLOR_ORION_DIM_TEXT);
+    }
+    drawAaCentered(AA_FONT_LARGE, currentText, 120, 47, COLOR_ORION_TEXT, COLOR_ORION_PANEL);
+    drawAaCentered(AA_FONT_SMALL, inputVoltageText, 78, 104, COLOR_ORION_TEXT, COLOR_ORION_PANEL);
+    drawAaCentered(AA_FONT_SMALL, outputVoltageText, 164, 104, COLOR_ORION_TEXT, COLOR_ORION_PANEL);
+    if (showValueLabels) {
+      drawTinyLabel("INPUT", 78, 130, COLOR_ORION_DIM_TEXT);
+      drawTinyLabel("OUTPUT", 164, 130, COLOR_ORION_DIM_TEXT);
+    }
+    drawAaCentered(AA_FONT_SMALL, inputCurrentText, 78, 147, COLOR_ORION_TEXT, COLOR_ORION_PANEL);
+    drawAaCentered(AA_FONT_SMALL, powerText, 164, 147, COLOR_ORION_TEXT, COLOR_ORION_PANEL);
+    if (showValueLabels) {
+      drawTinyLabel("IN AMPS", 78, 173, COLOR_ORION_DIM_TEXT);
+      drawTinyLabel("POWER", 164, 173, COLOR_ORION_DIM_TEXT);
+    }
+    drawAaCentered(AA_FONT_SMALL, statusText, 120, 185, COLOR_ORION_DIM_TEXT, COLOR_ORION_PANEL);
+  } else {
+    drawAaCentered(AA_FONT_LARGE, "-- A", 120, 50, COLOR_ORION_TEXT, COLOR_ORION_PANEL);
+    drawAaCentered(AA_FONT_SMALL, statusText, 120, 106, COLOR_ORION_DIM_TEXT, COLOR_ORION_PANEL);
+    drawDeviceLine(135, "Orion XS", orionSeen);
+    if (errorText.length()) {
+      gfx->setTextSize(1);
+      gfx->setTextColor(0xF800);
+      gfx->setCursor(74, 178);
+      gfx->print(errorText.substring(0, 20));
+    }
+  }
+
+  lastOrionCurrentText = currentText;
+  lastOrionInputVoltageText = inputVoltageText;
+  lastOrionOutputVoltageText = outputVoltageText;
+  lastOrionInputCurrentText = inputCurrentText;
+  lastOrionPowerText = powerText;
+  lastOrionStatusText = statusText;
+  lastOrionErrorText = errorText;
+  drawSettingsButton(COLOR_ORION_PANEL, COLOR_ORION_TEXT);
+  orionPageDrawn = true;
+}
+
 static void drawCaptureSecondRing(uint32_t remainingSeconds) {
   uint8_t litSegments = 0;
   if (captureActive && remainingSeconds > 0) {
@@ -2792,8 +2976,10 @@ static void drawCurrentPage(bool force) {
       drawGaugeFace();
     }
     drawGaugeValues(force);
-  } else {
+  } else if (currentPage == 1) {
     drawPageTwo(force);
+  } else {
+    drawOrionPage(force);
   }
 }
 
@@ -2811,6 +2997,7 @@ static void switchPage(uint8_t page, int8_t direction = 1) {
   lastPageChangeMs = millis();
   pageTwoDrawn = false;
   solarValuesDrawn = false;
+  orionPageDrawn = false;
   gaugeFaceDrawn = false;
   capturePageDrawn = false;
   drawCurrentPage(true);
@@ -2838,6 +3025,7 @@ static void closeSettingsPage() {
   gaugeFaceDrawn = false;
   pageTwoDrawn = false;
   solarValuesDrawn = false;
+  orionPageDrawn = false;
   capturePageDrawn = false;
   drawCurrentPage(true);
 }
@@ -3025,6 +3213,7 @@ static void handleTap(int16_t x, int16_t y) {
       secrets.putBool("demo_mode", demoModeEnabled);
       victronStats.valid = false;
       solarStats.valid = false;
+      orionStats.valid = false;
       settingsMessage = demoModeEnabled ? "Demo mode on" : "Demo mode off";
       settingsPageDrawn = false;
       drawCurrentPage(true);
