@@ -96,9 +96,9 @@ Omission rules:
 
 - UTC comes from NTP (`pool.ntp.org`, then `time.google.com`) on every connection.
 - The local offset comes from an IP-geolocation time service, refreshed at most once per day. The response must give the current UTC offset, including daylight saving.
-  - Primary: `https://worldtimeapi.org/api/ip`, which returns `raw_offset` and `dst_offset` in seconds.
-  - Fallback: `https://timeapi.io/api/TimeZone/ip`.
-  - The implementation must confirm each response format with a real request before relying on it.
+  - Primary: get the public IP from `https://api.ipify.org`, then `https://timeapi.io/api/TimeZone/ip?ipAddress=<ip>` and use `currentUtcOffset.seconds`.
+  - Fallback: `http://ip-api.com/json/?fields=status,message,offset` (HTTP only on the free tier), field `offset`.
+  - Amended 2026-10-29 after real requests during planning: worldtimeapi.org reset every connection, and timeapi.io returns HTTP 400 without `ipAddress`.
 - Optional override `tz_override`: a POSIX TZ string such as `CET-1CEST,M3.5.0,M10.5.0/3`. When set, it replaces the online lookup; use it when roaming makes the IP location wrong.
 - Before the first successful time sync after boot:
   - records are kept with a relative timestamp, and the absolute time is filled in at the first sync;
