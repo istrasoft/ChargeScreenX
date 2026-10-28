@@ -53,6 +53,30 @@ static void test_plausibility() {
   TEST_ASSERT_FALSE(cs::plausibleOptionalVoltage(2.0f));
 }
 
+static void test_plausible_shunt_current() {
+  TEST_ASSERT_TRUE(cs::plausibleShunt(13.2f, 80.0f, 25.5f));
+  TEST_ASSERT_TRUE(cs::plausibleShunt(13.2f, 102.3f, -250.0f));
+  TEST_ASSERT_TRUE(cs::plausibleShunt(13.2f, 80.0f, 1000.0f));
+  TEST_ASSERT_TRUE(cs::plausibleShunt(13.2f, 80.0f, -1000.0f));
+  TEST_ASSERT_FALSE(cs::plausibleShunt(13.2f, 80.0f, 1500.0f));
+  TEST_ASSERT_FALSE(cs::plausibleShunt(13.2f, 80.0f, -2000.0f));
+  TEST_ASSERT_FALSE(cs::plausibleShunt(13.2f, 80.0f, NAN));
+  TEST_ASSERT_FALSE(cs::plausibleShunt(4.0f, 80.0f, 10.0f));
+  TEST_ASSERT_FALSE(cs::plausibleShunt(13.2f, 150.0f, 10.0f));
+}
+
+static void test_plausible_solar() {
+  TEST_ASSERT_TRUE(cs::plausibleSolar(3, 13.6f, 250.0f));
+  TEST_ASSERT_TRUE(cs::plausibleSolar(0, 12.8f, 0.0f));
+  TEST_ASSERT_TRUE(cs::plausibleSolar(5, NAN, NAN));
+  TEST_ASSERT_TRUE(cs::plausibleSolar(4, 57.6f, 15000.0f));
+  TEST_ASSERT_FALSE(cs::plausibleSolar(99, 13.6f, 250.0f));
+  TEST_ASSERT_FALSE(cs::plausibleSolar(0xFF, 13.6f, 250.0f));
+  TEST_ASSERT_FALSE(cs::plausibleSolar(3, 2.0f, 250.0f));
+  TEST_ASSERT_FALSE(cs::plausibleSolar(3, 13.6f, 40000.0f));
+  TEST_ASSERT_FALSE(cs::plausibleSolar(3, 13.6f, -5.0f));
+}
+
 static void test_unlocked_accepts_any_address() {
   cs::DeviceLock lock;
   TEST_ASSERT_FALSE(cs::lockIsLocked(lock));
@@ -138,6 +162,8 @@ int main(int, char **) {
   RUN_TEST(test_normalise_mac);
   RUN_TEST(test_format_mac);
   RUN_TEST(test_plausibility);
+  RUN_TEST(test_plausible_shunt_current);
+  RUN_TEST(test_plausible_solar);
   RUN_TEST(test_unlocked_accepts_any_address);
   RUN_TEST(test_locks_after_three_good_decodes);
   RUN_TEST(test_other_address_resets_candidate);

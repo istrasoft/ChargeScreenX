@@ -132,3 +132,15 @@ On device (user, via USB flash):
 ## Out of scope
 
 WiFi client mode and pushing data to a remote endpoint (separate design), other device types, warning/alarm display, rear button.
+
+## Amendment (2026-10-28): tighter plausibility
+
+Why: a neighbour's device of the same kind whose key shares its first byte with the user's key passes the key-byte check on every advert. Its decrypted garbage passed the single-voltage check about 10 % of the time, so while the user's device was silent the neighbour could reach 3 good decodes, win the lock and keep it.
+
+The plausibility rules in section 2 are replaced by (checks in `cs::`, unit-tested natively; applied to every advert, locked or not):
+- **Known state** (`cs::chargerStateKnown`): the state has a specific `chargerStateText` name (0–7, 11, 245–248, 252). Anything else, including 0xFF, is rejected.
+- **Shunt** (`cs::plausibleShunt(voltage, soc, current)`): the existing voltage/SOC rule (SOC 102.3 % still accepted) and |current| ≤ 1000 A (`SHUNT_MAX_CURRENT_A`). SmartShunts are rated 300–2000 A and the user's is 300 A, so 1000 A leaves room for surges. The raw field spans ±2097 A, so this alone rejects about half of the garbage.
+- **Solar** (`cs::plausibleSolar(state, batteryVoltage, pvPower)`): known state, battery voltage NaN or 5.0–70.0 V, and PV power NaN or 0–15000 W (`SOLAR_MAX_PV_POWER_W`). The largest single Victron MPPT (SmartSolar RS 450/200) charges at most 200 A at ~62 V, about 12.4 kW plus losses, so 15 kW keeps headroom. That is above the 10 kW example in the review.
+- **Orion XS** (`cs::plausibleOrionXs(state, outputVoltage, inputVoltage)`): known state, and output and input voltage each NaN or 5.0–70.0 V.
+
+A rejected advert behaves as before: error `implausible`, it doesn't count towards a lock, and it doesn't replace valid data.

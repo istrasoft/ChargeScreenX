@@ -65,6 +65,28 @@ static void test_charger_state_text() {
   TEST_ASSERT_EQUAL_STRING("Charging", cs::chargerStateText(99));
 }
 
+static void test_charger_state_known() {
+  TEST_ASSERT_TRUE(cs::chargerStateKnown(0));
+  TEST_ASSERT_TRUE(cs::chargerStateKnown(3));
+  TEST_ASSERT_TRUE(cs::chargerStateKnown(7));
+  TEST_ASSERT_TRUE(cs::chargerStateKnown(11));
+  TEST_ASSERT_TRUE(cs::chargerStateKnown(245));
+  TEST_ASSERT_TRUE(cs::chargerStateKnown(252));
+  TEST_ASSERT_FALSE(cs::chargerStateKnown(8));
+  TEST_ASSERT_FALSE(cs::chargerStateKnown(99));
+  TEST_ASSERT_FALSE(cs::chargerStateKnown(0xFF));
+}
+
+static void test_plausible_orion_xs() {
+  TEST_ASSERT_TRUE(cs::plausibleOrionXs(3, 14.2f, 13.4f));
+  TEST_ASSERT_TRUE(cs::plausibleOrionXs(0, NAN, NAN));
+  TEST_ASSERT_TRUE(cs::plausibleOrionXs(11, 13.8f, NAN));
+  TEST_ASSERT_FALSE(cs::plausibleOrionXs(99, 14.2f, 13.4f));
+  TEST_ASSERT_FALSE(cs::plausibleOrionXs(3, 120.0f, 13.4f));
+  TEST_ASSERT_FALSE(cs::plausibleOrionXs(3, 14.2f, 2.0f));
+  TEST_ASSERT_FALSE(cs::plausibleOrionXs(3, 14.2f, 600.0f));
+}
+
 int main(int, char **) {
   UNITY_BEGIN();
   RUN_TEST(test_parse_orion_xs_values);
@@ -72,5 +94,7 @@ int main(int, char **) {
   RUN_TEST(test_parse_orion_xs_rejects_short_data);
   RUN_TEST(test_off_reason_text);
   RUN_TEST(test_charger_state_text);
+  RUN_TEST(test_charger_state_known);
+  RUN_TEST(test_plausible_orion_xs);
   return UNITY_END();
 }

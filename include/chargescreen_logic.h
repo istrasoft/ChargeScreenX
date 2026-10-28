@@ -78,6 +78,15 @@ inline bool plausibleShunt(float voltage, float soc) {
   return plausibleSystemVoltage(voltage) && socOk;
 }
 
+// SmartShunts are rated 300-2000 A; the user's is 300 A, and real surges stay
+// well under 1000 A. The raw field spans +/-2097 A, so this ceiling rejects
+// about half of a neighbour's decrypted garbage on its own.
+constexpr float SHUNT_MAX_CURRENT_A = 1000.0f;
+
+inline bool plausibleShunt(float voltage, float soc, float current) {
+  return plausibleShunt(voltage, soc) && std::fabs(current) <= SHUNT_MAX_CURRENT_A;
+}
+
 constexpr uint8_t LOCK_CONFIRM_DECODES = 3;
 
 struct DeviceLock {
@@ -261,7 +270,8 @@ inline const char *orionOffReasonText(uint32_t offReason) {
   return nullptr;
 }
 
-inline const char *chargerStateText(uint8_t state) {
+// Returns nullptr for states without a specific name.
+inline const char *chargerStateName(uint8_t state) {
   switch (state) {
     case 0:
       return "Off";
@@ -292,8 +302,35 @@ inline const char *chargerStateText(uint8_t state) {
     case 252:
       return "External";
     default:
-      return "Charging";
+      return nullptr;
   }
+}
+
+inline const char *chargerStateText(uint8_t state) {
+  const char *name = chargerStateName(state);
+  return name ? name : "Charging";
+}
+
+inline bool chargerStateKnown(uint8_t state) {
+  return chargerStateName(state) != nullptr;
+}
+
+// The largest single Victron MPPT (SmartSolar RS 450/200) charges at most
+// 200 A at ~62 V, about 12.4 kW plus conversion losses. 15 kW leaves headroom
+// for that while still rejecting most of the raw 0-65534 W range that a
+// neighbour's decrypted garbage lands in.
+constexpr float SOLAR_MAX_PV_POWER_W = 15000.0f;
+
+// NaN battery voltage / PV power means "not available" and is accepted.
+inline bool plausibleSolar(uint8_t deviceState, float batteryVoltage, float pvPower) {
+  bool pvOk = std::isnan(pvPower) || (pvPower >= 0.0f && pvPower <= SOLAR_MAX_PV_POWER_W);
+  return chargerStateKnown(deviceState) && plausibleOptionalVoltage(batteryVoltage) && pvOk;
+}
+
+// NaN voltages mean "not available" and are accepted.
+inline bool plausibleOrionXs(uint8_t state, float outputVoltage, float inputVoltage) {
+  return chargerStateKnown(state) && plausibleOptionalVoltage(outputVoltage) &&
+         plausibleOptionalVoltage(inputVoltage);
 }
 
 }  // namespace cs

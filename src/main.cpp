@@ -1622,7 +1622,7 @@ static void handleShuntAdvert(const String &name,
   BatteryStats decoded;
   String error;
   bool ok = decodeVictronBatteryMonitor(manufacturerData, decoded, error);
-  if (ok && !cs::plausibleShunt(decoded.voltage, decoded.soc)) {
+  if (ok && !cs::plausibleShunt(decoded.voltage, decoded.soc, decoded.current)) {
     ok = false;
     error = "implausible";
   }
@@ -1662,7 +1662,7 @@ static void handleSolarAdvert(const String &name,
   SolarStats decoded;
   String error;
   bool ok = decodeVictronSolarCharger(manufacturerData, decoded, error);
-  if (ok && !cs::plausibleOptionalVoltage(decoded.batteryVoltage)) {
+  if (ok && !cs::plausibleSolar(decoded.deviceState, decoded.batteryVoltage, decoded.pvPower)) {
     ok = false;
     error = "implausible";
   }
@@ -1702,7 +1702,7 @@ static void handleOrionAdvert(const String &name,
   OrionStats decoded;
   String error;
   bool ok = decodeVictronOrionXs(manufacturerData, decoded, error);
-  if (ok && !cs::plausibleOptionalVoltage(decoded.outputVoltage)) {
+  if (ok && !cs::plausibleOrionXs(decoded.deviceState, decoded.outputVoltage, decoded.inputVoltage)) {
     ok = false;
     error = "implausible";
   }
