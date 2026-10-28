@@ -48,6 +48,7 @@ static constexpr uint16_t VICTRON_COMPANY_ID = 0x02E1;
 static constexpr uint8_t VICTRON_PRODUCT_ADVERTISEMENT = 0x10;
 static constexpr uint8_t VICTRON_SOLAR_CHARGER_RECORD = 0x01;
 static constexpr uint8_t VICTRON_BATTERY_MONITOR_RECORD = 0x02;
+static constexpr uint8_t VICTRON_ORION_XS_RECORD = 0x0F;
 static constexpr uint8_t DISPLAY_ROTATION = 2;
 static constexpr uint16_t COLOR_DARK_BLUE = 0x014A;
 static constexpr uint16_t COLOR_PANEL_BLUE = 0x0129;
@@ -158,13 +159,28 @@ struct SolarStats {
   String error = "waiting";
 };
 
+struct OrionStats {
+  bool valid = false;
+  uint8_t deviceState = 0xFF;
+  uint8_t errorCode = 0xFF;
+  float outputVoltage = NAN;
+  float outputCurrent = NAN;
+  float inputVoltage = NAN;
+  float inputCurrent = NAN;
+  uint32_t offReason = 0;
+  String error = "waiting";
+};
+
 BleSeen victronSeen;
 BleSeen solarSeen;
 BleSeen ecoSeen;
+BleSeen orionSeen;
 BatteryStats victronStats;
 SolarStats solarStats;
+OrionStats orionStats;
 static cs::DeviceLock shuntLock;
 static cs::DeviceLock solarLock;
+static cs::DeviceLock orionLock;
 static bool gaugeFaceDrawn = false;
 static bool gaugeValuesDrawn = false;
 static int lastSocDisplay = -1;
@@ -186,6 +202,8 @@ static uint32_t lastVictronAdvertMs = 0;
 static uint32_t lastVictronDecodeMs = 0;
 static uint32_t lastSolarAdvertMs = 0;
 static uint32_t lastSolarDecodeMs = 0;
+static uint32_t lastOrionAdvertMs = 0;
+static uint32_t lastOrionDecodeMs = 0;
 static uint32_t lastBleWatchdogMs = 0;
 static uint32_t lastBleScanStartMs = 0;
 static uint8_t currentPage = 0;
@@ -208,6 +226,7 @@ static bool settingsServerActive = false;
 static uint32_t lastSettingsServerActivityMs = 0;
 static String storedVictronKey;
 static String storedSolarKey;
+static String storedOrionKey;
 static String storedEcoWorthyPassword;
 static bool demoModeEnabled = DEMO_MODE;
 static bool ecoWorthyBatteryMode = false;
@@ -475,6 +494,10 @@ static const char *activeSolarKey() {
   return "";
 }
 
+static const char *activeOrionKey() {
+  return storedOrionKey.c_str();
+}
+
 static const char *activeEcoWorthyPassword() {
   return storedEcoWorthyPassword.length() ? storedEcoWorthyPassword.c_str() : "123123";
 }
@@ -549,16 +572,18 @@ static String cycleText() {
 }
 
 static cs::PageAvailability pageAvailability() {
-  return cs::PageAvailability{demoModeEnabled, storedSolarKey.length() > 0, false};
+  return cs::PageAvailability{demoModeEnabled, storedSolarKey.length() > 0, storedOrionKey.length() > 0};
 }
 
 static void loadStoredSecrets() {
   secrets.begin("victron", false);
   storedVictronKey = secrets.getString("shunt_key", "");
   storedSolarKey = secrets.getString("solar_key", "");
+  storedOrionKey = secrets.getString("orion_key", "");
   storedEcoWorthyPassword = secrets.getString("eco_key", "");
   cs::lockRestore(shuntLock, secrets.getString("shunt_mac", "").c_str(), millis());
   cs::lockRestore(solarLock, secrets.getString("solar_mac", "").c_str(), millis());
+  cs::lockRestore(orionLock, secrets.getString("orion_mac", "").c_str(), millis());
   demoModeEnabled = secrets.getBool("demo_mode", DEMO_MODE);
   ecoWorthyBatteryMode = secrets.getBool("battery_eco", false);
   showValueLabels = secrets.getBool("value_labels", true);
@@ -833,6 +858,62 @@ static bool decodeVictronSolarCharger(const std::string &manufacturerData, Solar
                 out.pvPower,
                 out.yieldTodayKwh,
                 out.loadCurrent);
+  return true;
+}
+
+static bool decodeVictronOrionXs(const std::string &manufacturerData, OrionStats &out, String &error) {
+  if (manufacturerData.size() < 11) {
+    error = "short advert";
+    return false;
+  }
+
+  const uint8_t *data = reinterpret_cast<const uint8_t *>(manufacturerData.data());
+  const uint8_t *payload = data + 2;
+  size_t payloadLen = manufacturerData.size() - 2;
+
+  if (payloadLen < 9 || payload[0] != VICTRON_PRODUCT_ADVERTISEMENT) {
+    error = "not instant";
+    return false;
+  }
+
+  if (payload[4] != VICTRON_ORION_XS_RECORD) {
+    error = "not Orion record";
+    return false;
+  }
+
+  uint8_t plain[16] = {};
+  size_t encryptedLen = sizeof(plain);
+
+  if (!decryptVictronPayload(payload, payloadLen, activeOrionKey(), plain, encryptedLen, error)) {
+    return false;
+  }
+
+  cs::OrionXsReading reading;
+  if (!cs::parseOrionXs(plain, encryptedLen, reading)) {
+    error = "short data";
+    return false;
+  }
+
+  out = OrionStats();
+  out.deviceState = reading.state;
+  out.errorCode = reading.error;
+  out.outputVoltage = reading.outputVoltage;
+  out.outputCurrent = reading.outputCurrent;
+  out.inputVoltage = reading.inputVoltage;
+  out.inputCurrent = reading.inputCurrent;
+  out.offReason = reading.offReason;
+  out.valid = true;
+  out.error = "";
+
+  logDecryptedBytes("Victron Orion XS", plain, encryptedLen);
+  Serial.printf("Victron Orion XS decoded state=%u err=%u out=%.2fV %.1fA in=%.2fV %.1fA off=0x%08lX\n",
+                out.deviceState,
+                out.errorCode,
+                out.outputVoltage,
+                out.outputCurrent,
+                out.inputVoltage,
+                out.inputCurrent,
+                static_cast<unsigned long>(out.offReason));
   return true;
 }
 
@@ -1115,39 +1196,6 @@ static void drawTinyLabel(const String &label, int16_t centerX, int16_t y, uint1
   gfx->print(label);
 }
 
-static const char *solarStateText(uint8_t state) {
-  switch (state) {
-    case 0:
-      return "Off";
-    case 1:
-      return "Low power";
-    case 2:
-      return "Fault";
-    case 3:
-      return "Bulk";
-    case 4:
-      return "Absorption";
-    case 5:
-      return "Float";
-    case 6:
-      return "Storage";
-    case 7:
-      return "Equalize";
-    case 245:
-      return "Starting";
-    case 246:
-      return "Absorb again";
-    case 247:
-      return "Recondition";
-    case 248:
-      return "BatterySafe";
-    case 252:
-      return "External";
-    default:
-      return "Charging";
-  }
-}
-
 static SolarStats displaySolarStats() {
   if (!demoModeEnabled) {
     return solarStats;
@@ -1189,7 +1237,7 @@ static String displaySolarStatusText(const SolarStats &stats) {
     return String("Error ") + String(stats.errorCode);
   }
 
-  return solarStateText(stats.deviceState);
+  return cs::chargerStateText(stats.deviceState);
 }
 
 static BatteryStats displayStats() {
@@ -1552,6 +1600,46 @@ static void handleSolarAdvert(const String &name,
                 bytesToHex(manufacturerData).c_str());
 }
 
+static void handleOrionAdvert(const String &name,
+                              const String &address,
+                              const char *mac,
+                              int rssi,
+                              const std::string &manufacturerData) {
+  if (!cs::lockAccepts(orionLock, mac)) {
+    return;
+  }
+
+  uint32_t now = millis();
+  cs::lockNoteSeen(orionLock, mac, now);
+  orionSeen.name = name.length() ? name : "Orion XS";
+  orionSeen.address = address;
+  orionSeen.rssi = rssi;
+  orionSeen.seenMs = now;
+  lastOrionAdvertMs = now;
+
+  OrionStats decoded;
+  String error;
+  bool ok = decodeVictronOrionXs(manufacturerData, decoded, error);
+  if (ok && !cs::plausibleOptionalVoltage(decoded.outputVoltage)) {
+    ok = false;
+    error = "implausible";
+  }
+
+  if (ok) {
+    orionStats = decoded;
+    lastOrionDecodeMs = now;
+    noteVictronGoodDecode(orionLock, "orion_mac", "Orion XS", mac, address);
+  } else if (!orionStats.valid) {
+    orionStats.error = error;
+  }
+
+  Serial.printf("Victron Orion XS %s RSSI %d %s data %s\n",
+                address.c_str(),
+                rssi,
+                ok ? "decoded" : error.c_str(),
+                bytesToHex(manufacturerData).c_str());
+}
+
 class ScanCallbacks : public NimBLEScanCallbacks {
   void onResult(const NimBLEAdvertisedDevice *device) override {
     if (captureActive) {
@@ -1574,6 +1662,8 @@ class ScanCallbacks : public NimBLEScanCallbacks {
             handleShuntAdvert(name, address, mac, rssi, manufacturerData);
           } else if (recordType == VICTRON_SOLAR_CHARGER_RECORD) {
             handleSolarAdvert(name, address, mac, rssi, manufacturerData);
+          } else if (recordType == VICTRON_ORION_XS_RECORD) {
+            handleOrionAdvert(name, address, mac, rssi, manufacturerData);
           }
         }
       }
@@ -1771,10 +1861,15 @@ static String settingsPageHtml(const String &message = "") {
   html += F("<label for='solar_key'>Solar controller key</label><input id='solar_key' name='solar_key' autocomplete='off' placeholder='");
   html += maskedKeyText(storedSolarKey);
   html += F("'>");
+  html += F("<label for='orion_key'>Orion XS key</label><input id='orion_key' name='orion_key' autocomplete='off' placeholder='");
+  html += maskedKeyText(storedOrionKey);
+  html += F("'>");
   html += F("<p class='hint'>Battery monitor: ");
   html += lockStatusText(shuntLock);
   html += F("<br>Solar controller: ");
   html += lockStatusText(solarLock);
+  html += F("<br>Orion XS: ");
+  html += lockStatusText(orionLock);
   html += F("</p>");
   html += F("<h2>Eco-Worthy</h2>");
   html += F("<p class='hint'>Eco-Worthy/JBD support is not working yet. These settings are here for testing future compatibility. Batteries commonly use password 123123.</p>");
@@ -1920,6 +2015,7 @@ static void handleSettingsSave() {
   bool invalid = false;
   String shuntKey = normaliseKeyHex(settingsServer.arg("shunt_key"));
   String solarKey = normaliseKeyHex(settingsServer.arg("solar_key"));
+  String orionKey = normaliseKeyHex(settingsServer.arg("orion_key"));
   String ecoKey = normalisePassword(settingsServer.arg("eco_key"));
   String solarWattsText = settingsServer.arg("solar_watts");
   String screenTimeoutText = settingsServer.arg("screen_timeout");
@@ -1954,6 +2050,19 @@ static void handleSettingsSave() {
       }
       storedSolarKey = solarKey;
       secrets.putString("solar_key", storedSolarKey);
+      saved = true;
+    } else {
+      invalid = true;
+    }
+  }
+
+  if (orionKey.length()) {
+    if (isValidKeyHex(orionKey)) {
+      if (orionKey != storedOrionKey) {
+        releaseVictronLock(orionLock, "orion_mac", "Orion XS", "key changed");
+      }
+      storedOrionKey = orionKey;
+      secrets.putString("orion_key", storedOrionKey);
       saved = true;
     } else {
       invalid = true;
@@ -2096,6 +2205,7 @@ static void handleSettingsSave() {
     if (!demoModeEnabled) {
       victronStats.valid = false;
       solarStats.valid = false;
+      orionStats.valid = false;
     }
     settingsMessage = "Saved settings";
     redirectToSettingsPage("saved");
@@ -2111,15 +2221,19 @@ static void handleSettingsClearKeys() {
   noteSettingsServerActivity();
   storedVictronKey = "";
   storedSolarKey = "";
+  storedOrionKey = "";
   storedEcoWorthyPassword = "";
   secrets.remove("shunt_key");
   secrets.remove("solar_key");
+  secrets.remove("orion_key");
   secrets.remove("eco_key");
   releaseVictronLock(shuntLock, "shunt_mac", "shunt", "keys cleared");
   releaseVictronLock(solarLock, "solar_mac", "solar", "keys cleared");
+  releaseVictronLock(orionLock, "orion_mac", "Orion XS", "keys cleared");
   if (!demoModeEnabled) {
     victronStats.valid = false;
     solarStats.valid = false;
+    orionStats.valid = false;
   }
   settingsMessage = "Keys cleared";
   redirectToSettingsPage("cleared");
@@ -2391,7 +2505,7 @@ static void drawSettingsInfoPage(bool force = false) {
   drawInfoLine(124, "Rotation", String(screenRotationDegrees));
   drawInfoLine(144, "Battery", batteryModeText());
   drawInfoLine(164, "Label/Grid", String(showValueLabels ? "On/" : "Off/") + (showValueGrid ? "On" : "Off"));
-  drawInfoLine(184, "Keys", storedVictronKey.length() || storedSolarKey.length() ? "saved" : "-");
+  drawInfoLine(184, "Keys", storedVictronKey.length() || storedSolarKey.length() || storedOrionKey.length() ? "saved" : "-");
 
   drawBackButton();
   settingsPageDrawn = true;
@@ -3090,6 +3204,7 @@ static void updateBleWatchdog() {
     restartBleScan("Victron quiet");
   } else if (lastVictronAdvertMs == 0 &&
              lastSolarAdvertMs == 0 &&
+             lastOrionAdvertMs == 0 &&
              now - lastBleScanStartMs > BLE_NEVER_SEEN_RESTART_MS) {
     restartBleScan("no Victron yet");
   }
@@ -3106,12 +3221,22 @@ static void updateBleWatchdog() {
     drawCurrentPage(true);
   }
 
+  if (orionStats.valid && lastOrionDecodeMs > 0 && now - lastOrionDecodeMs > VICTRON_SIGNAL_LOST_MS) {
+    orionStats.valid = false;
+    orionStats.error = "signal lost";
+    drawCurrentPage(true);
+  }
+
   if (cs::lockExpired(shuntLock, now, VICTRON_LOCK_RELEASE_MS)) {
     releaseVictronLock(shuntLock, "shunt_mac", "shunt", "not seen for 10 min");
   }
 
   if (cs::lockExpired(solarLock, now, VICTRON_LOCK_RELEASE_MS)) {
     releaseVictronLock(solarLock, "solar_mac", "solar", "not seen for 10 min");
+  }
+
+  if (cs::lockExpired(orionLock, now, VICTRON_LOCK_RELEASE_MS)) {
+    releaseVictronLock(orionLock, "orion_mac", "Orion XS", "not seen for 10 min");
   }
 
   if (demoModeEnabled) {

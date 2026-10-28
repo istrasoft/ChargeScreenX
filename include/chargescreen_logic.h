@@ -202,4 +202,95 @@ inline bool cycleDue(uint32_t now, uint32_t lastPageChangeMs, uint32_t lastTouch
          static_cast<uint32_t>(now - lastTouchMs) >= intervalMs;
 }
 
+// Victron Orion XS Instant Readout record (type 0x0F). Undocumented by Victron;
+// layout matches keshavdv/victron-ble orion_xs.py.
+struct OrionXsReading {
+  uint8_t state = 0xFF;
+  uint8_t error = 0xFF;
+  float outputVoltage = NAN;
+  float outputCurrent = NAN;
+  float inputVoltage = NAN;
+  float inputCurrent = NAN;
+  uint32_t offReason = 0;
+};
+
+inline float scaledOrNan(uint32_t raw, float scale) {
+  return raw == 0xFFFF ? NAN : static_cast<float>(raw) * scale;
+}
+
+inline bool parseOrionXs(const uint8_t *plain, size_t len, OrionXsReading &out) {
+  if (len < 14) {
+    return false;
+  }
+  out.state = static_cast<uint8_t>(readBits(plain, len, 0, 8));
+  out.error = static_cast<uint8_t>(readBits(plain, len, 8, 8));
+  out.outputVoltage = scaledOrNan(readBits(plain, len, 16, 16), 0.01f);
+  out.outputCurrent = scaledOrNan(readBits(plain, len, 32, 16), 0.1f);
+  out.inputVoltage = scaledOrNan(readBits(plain, len, 48, 16), 0.01f);
+  out.inputCurrent = scaledOrNan(readBits(plain, len, 64, 16), 0.1f);
+  out.offReason = readBits(plain, len, 80, 32);
+  return true;
+}
+
+// Off-reason bits from victron-ble OffReason. Returns nullptr when no known bit is set.
+inline const char *orionOffReasonText(uint32_t offReason) {
+  if (offReason & 0x80) {
+    return "Engine off";
+  }
+  if (offReason & 0x01) {
+    return "No input";
+  }
+  if (offReason & (0x02 | 0x04)) {
+    return "Switched off";
+  }
+  if (offReason & 0x08) {
+    return "Remote off";
+  }
+  if (offReason & 0x10) {
+    return "Protection";
+  }
+  if (offReason & 0x40) {
+    return "BMS off";
+  }
+  if (offReason & 0x100) {
+    return "Checking input";
+  }
+  return nullptr;
+}
+
+inline const char *chargerStateText(uint8_t state) {
+  switch (state) {
+    case 0:
+      return "Off";
+    case 1:
+      return "Low power";
+    case 2:
+      return "Fault";
+    case 3:
+      return "Bulk";
+    case 4:
+      return "Absorption";
+    case 5:
+      return "Float";
+    case 6:
+      return "Storage";
+    case 7:
+      return "Equalize";
+    case 11:
+      return "Power supply";
+    case 245:
+      return "Starting";
+    case 246:
+      return "Absorb again";
+    case 247:
+      return "Recondition";
+    case 248:
+      return "BatterySafe";
+    case 252:
+      return "External";
+    default:
+      return "Charging";
+  }
+}
+
 }  // namespace cs
