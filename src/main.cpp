@@ -12,6 +12,7 @@
 
 #include "aa_font.h"
 #include "build_version.h"
+#include "chargescreen_logic.h"
 
 static constexpr const char *SETTINGS_AP_SSID = "ChargeScreen";
 static constexpr const char *SETTINGS_AP_PASSWORD = "";
@@ -602,26 +603,8 @@ static void loadStoredSecrets() {
   currentDisplayRotation = static_cast<uint8_t>(((screenRotationDegrees + 45) / 90) % 4);
 }
 
-static int32_t signExtend(uint32_t value, uint8_t width) {
-  uint32_t signBit = 1UL << (width - 1);
-  uint32_t mask = (1UL << width) - 1;
-  value &= mask;
-  return static_cast<int32_t>((value ^ signBit) - signBit);
-}
-
-static uint32_t readBits(const uint8_t *data, size_t dataLen, uint16_t startBit, uint8_t bitCount) {
-  uint32_t value = 0;
-  for (uint8_t i = 0; i < bitCount; i++) {
-    uint16_t bit = startBit + i;
-    if ((bit / 8) >= dataLen) {
-      break;
-    }
-    if (data[bit / 8] & (1 << (bit % 8))) {
-      value |= (1UL << i);
-    }
-  }
-  return value;
-}
+using cs::readBits;
+using cs::signExtend;
 
 static bool readLeU16(const uint8_t *data, size_t dataLen, size_t offset, uint16_t &value) {
   if (offset + 1 >= dataLen) {
