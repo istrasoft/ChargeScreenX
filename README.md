@@ -20,9 +20,22 @@ For the Victron shunt the dashboard should listen passively. It does not need to
 
 ## Settings Hotspot
 
-Tap the cog at the bottom of either dashboard screen to open Settings. The Start WiFi box starts a temporary hotspot named `ChargeScreen`. Connect to it and open `http://192.168.4.1/` to paste Victron Instant Readout keys.
+Tap the dots at the bottom of any dashboard screen to open Settings. The WiFi row starts a temporary hotspot named `ChargeScreen`. Connect to it and open `http://192.168.4.1/` to paste Victron Instant Readout keys for the battery monitor, solar controller, and Orion XS.
 
 Keys entered there are stored in the ESP32 flash preferences area. No Victron keys are compiled into the firmware. The setup hotspot turns itself off after 5 minutes without webpage activity.
+
+## Screens
+
+- Battery (always shown), Solar (shown when a solar key is saved), Orion XS DC-DC (shown when an Orion key is saved). Demo mode shows all screens.
+- Screen cycle: Off, 10, 20, 30, or 60 seconds, set on settings page 3 or on the setup page. Cycling pauses after a touch.
+
+## Device Lock
+
+Each Victron device kind locks to the first address that decodes correctly three times in a row, so nearby vans or boats with Victron gear are ignored. The lock is released if the device is not heard for 10 minutes or its key is changed. The setup page shows the locked address.
+
+## Flashing
+
+This fork is flashed over USB only (`pio run -t upload`); there is no web firmware update. It uses a single 3 MB app partition. Unit tests for the device-independent logic run with `pio test -e native`.
 
 ## License
 
