@@ -97,8 +97,9 @@ static constexpr int16_t SETTINGS_ROTATION_Y = 168;
 static constexpr int16_t SETTINGS_TIMEOUT_Y = 76;
 static constexpr int16_t SETTINGS_BATTERY_Y = 116;
 static constexpr int16_t SETTINGS_DIMMING_Y = 156;
-static constexpr int16_t SETTINGS_LABELS_Y = 98;
-static constexpr int16_t SETTINGS_GRID_Y = 136;
+static constexpr int16_t SETTINGS_LABELS_Y = 76;
+static constexpr int16_t SETTINGS_GRID_Y = 116;
+static constexpr int16_t SETTINGS_CYCLE_Y = 156;
 static constexpr int16_t ROTATE_BUTTON_X = 70;
 static constexpr int16_t ROTATE_BUTTON_Y = 68;
 static constexpr int16_t ROTATE_BUTTON_W = 100;
@@ -225,6 +226,8 @@ static float demoSolarBatteryVoltage = 14.42f;
 static float demoSolarChargeCurrent = 18.6f;
 static float demoSolarYieldKwh = 1.27f;
 static uint16_t solarArrayWatts = DEFAULT_SOLAR_ARRAY_WATTS;
+static uint16_t cycleSeconds = 0;
+static uint32_t lastPageChangeMs = 0;
 static String settingsMessage;
 static bool screenAwake = true;
 static uint32_t lastTouchActivityMs = 0;
@@ -541,6 +544,14 @@ static String backlightLevelText() {
   }
 }
 
+static String cycleText() {
+  return cycleSeconds ? String(cycleSeconds) + "s" : String("-");
+}
+
+static cs::PageAvailability pageAvailability() {
+  return cs::PageAvailability{demoModeEnabled, storedSolarKey.length() > 0, false};
+}
+
 static void loadStoredSecrets() {
   secrets.begin("victron", false);
   storedVictronKey = secrets.getString("shunt_key", "");
@@ -552,6 +563,7 @@ static void loadStoredSecrets() {
   ecoWorthyBatteryMode = secrets.getBool("battery_eco", false);
   showValueLabels = secrets.getBool("value_labels", true);
   showValueGrid = secrets.getBool("value_grid", true);
+  cycleSeconds = cs::sanitiseCycleSeconds(secrets.getUShort("cycle_secs", 0));
   solarArrayWatts = secrets.getUShort("solar_watts", DEFAULT_SOLAR_ARRAY_WATTS);
   uint16_t sanitisedSolarArrayWatts = sanitiseSolarArrayWatts(solarArrayWatts);
   if (sanitisedSolarArrayWatts != solarArrayWatts) {
@@ -1808,6 +1820,18 @@ static String settingsPageHtml(const String &message = "") {
     html += F("</option>");
   }
   html += F("</select>");
+  html += F("<label for='cycle_secs'>Screen cycle</label><select id='cycle_secs' name='cycle_secs'>");
+  const uint16_t cycleOptions[] = {0, 10, 20, 30, 60};
+  for (uint16_t seconds : cycleOptions) {
+    html += F("<option value='");
+    html += seconds;
+    html += F("'");
+    html += cycleSeconds == seconds ? F(" selected") : F("");
+    html += F(">");
+    html += seconds ? String(seconds) + " seconds" : String("Off");
+    html += F("</option>");
+  }
+  html += F("</select>");
   html += F("<label for='dimming'>Dimming</label><select id='dimming' name='dimming'><option value='0'");
   html += backlightLevel == BACKLIGHT_LEVEL_MAX ? F(" selected") : F("");
   html += F(">Max</option><option value='1'");
@@ -1902,6 +1926,8 @@ static void handleSettingsSave() {
   String batteryModeText = settingsServer.arg("battery_mode");
   String rotationText = settingsServer.arg("screen_rotation");
   String dimmingText = settingsServer.arg("dimming");
+  String cycleArg = settingsServer.arg("cycle_secs");
+  cycleArg.trim();
   solarWattsText.trim();
   screenTimeoutText.trim();
   batteryModeText.trim();
@@ -2025,6 +2051,20 @@ static void handleSettingsSave() {
       backlightLevel = sanitiseBacklightLevel(static_cast<uint8_t>(requestedDimming));
       secrets.putUChar("backlight", backlightLevel);
       applyBacklightLevel();
+      saved = true;
+    } else {
+      invalid = true;
+    }
+  }
+
+  if (cycleArg.length()) {
+    int requestedCycle = cycleArg.toInt();
+    uint16_t nextCycle = cs::sanitiseCycleSeconds(requestedCycle);
+    if (nextCycle == requestedCycle) {
+      if (nextCycle != cycleSeconds) {
+        cycleSeconds = nextCycle;
+        secrets.putUShort("cycle_secs", cycleSeconds);
+      }
       saved = true;
     } else {
       invalid = true;
@@ -2263,6 +2303,7 @@ static void drawSettingsPage(bool force = false) {
   } else {
     drawRow(SETTINGS_LABELS_Y, "Labels", showValueLabels ? "On" : "-", showValueLabels);
     drawRow(SETTINGS_GRID_Y, "Grid", showValueGrid ? "On" : "-", showValueGrid);
+    drawRow(SETTINGS_CYCLE_Y, "Cycle", cycleText(), cycleSeconds > 0);
   }
 
   drawBackButton();
@@ -2626,6 +2667,12 @@ static void drawCurrentPage(bool force) {
     return;
   }
 
+  if (!cs::pageVisible(currentPage, pageAvailability())) {
+    currentPage = 0;
+    gaugeFaceDrawn = false;
+    force = true;
+  }
+
   if (currentPage == 0) {
     if (force) {
       drawGaugeFace();
@@ -2647,6 +2694,7 @@ static void switchPage(uint8_t page, int8_t direction = 1) {
   }
 
   currentPage = page;
+  lastPageChangeMs = millis();
   pageTwoDrawn = false;
   solarValuesDrawn = false;
   gaugeFaceDrawn = false;
@@ -2655,9 +2703,7 @@ static void switchPage(uint8_t page, int8_t direction = 1) {
 }
 
 static void togglePageFromSwipe(int8_t direction) {
-  uint8_t nextPage = direction >= 0
-                         ? (currentPage + 1) % PAGE_COUNT
-                         : (currentPage + PAGE_COUNT - 1) % PAGE_COUNT;
+  uint8_t nextPage = cs::nextVisiblePage(currentPage, direction, PAGE_COUNT, pageAvailability());
   switchPage(nextPage, direction);
 }
 
@@ -2820,6 +2866,15 @@ static void handleTap(int16_t x, int16_t y) {
         invalidateScreens();
         settingsPageActive = true;
         settingsPageIndex = 2;
+        settingsPageDrawn = false;
+        drawCurrentPage(true);
+        return;
+      }
+
+      if (pointInRect(x, y, SETTINGS_ROW_X, SETTINGS_CYCLE_Y, SETTINGS_VALUE_X + SETTINGS_VALUE_W - SETTINGS_ROW_X, SETTINGS_ROW_H)) {
+        cycleSeconds = cs::nextCycleSeconds(cycleSeconds);
+        secrets.putUShort("cycle_secs", cycleSeconds);
+        settingsMessage = String("Cycle ") + cycleText();
         settingsPageDrawn = false;
         drawCurrentPage(true);
         return;
@@ -3203,6 +3258,21 @@ static void updateTouchSwipe() {
   }
 }
 
+static void updateAutoCycle() {
+  if (!screenAwake || cycleSeconds == 0 || captureActive || captureReadyScreenActive ||
+      settingsPageActive || settingsRotationPageActive || settingsInfoPageActive) {
+    return;
+  }
+
+  uint32_t now = millis();
+  if (!cs::cycleDue(now, lastPageChangeMs, lastTouchActivityMs, cycleSeconds)) {
+    return;
+  }
+
+  lastPageChangeMs = now;
+  switchPage(cs::nextVisiblePage(currentPage, 1, PAGE_COUNT, pageAvailability()), 1);
+}
+
 void setup() {
   Serial.begin(115200);
   delay(300);
@@ -3242,6 +3312,7 @@ void loop() {
   updateSettingsServer();
   updateBleWatchdog();
   updateTouchSwipe();
+  updateAutoCycle();
   updateScreenTimeout();
 
   if (captureActive && millis() - captureStartMs >= CAPTURE_DURATION_MS) {

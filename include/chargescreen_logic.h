@@ -145,4 +145,61 @@ inline bool lockRestore(DeviceLock &lock, const char *storedMac, uint32_t now) {
   return true;
 }
 
+struct PageAvailability {
+  bool demo;
+  bool solar;
+  bool orion;
+};
+
+// Page order: 0 battery, 1 solar, 2 Orion XS.
+inline bool pageVisible(uint8_t page, const PageAvailability &availability) {
+  if (page > 2) {
+    return false;
+  }
+  if (page == 0 || availability.demo) {
+    return true;
+  }
+  return page == 1 ? availability.solar : availability.orion;
+}
+
+inline uint8_t nextVisiblePage(uint8_t current, int8_t direction, uint8_t pageCount, const PageAvailability &availability) {
+  for (uint8_t step = 1; step <= pageCount; step++) {
+    uint8_t index = direction >= 0
+                        ? static_cast<uint8_t>((current + step) % pageCount)
+                        : static_cast<uint8_t>((current + pageCount - step) % pageCount);
+    if (pageVisible(index, availability)) {
+      return index;
+    }
+  }
+  return current;
+}
+
+inline uint16_t sanitiseCycleSeconds(int value) {
+  return (value == 10 || value == 20 || value == 30 || value == 60) ? static_cast<uint16_t>(value) : 0;
+}
+
+inline uint16_t nextCycleSeconds(uint16_t value) {
+  switch (value) {
+    case 0:
+      return 10;
+    case 10:
+      return 20;
+    case 20:
+      return 30;
+    case 30:
+      return 60;
+    default:
+      return 0;
+  }
+}
+
+inline bool cycleDue(uint32_t now, uint32_t lastPageChangeMs, uint32_t lastTouchMs, uint16_t cycleSeconds) {
+  if (cycleSeconds == 0) {
+    return false;
+  }
+  uint32_t intervalMs = static_cast<uint32_t>(cycleSeconds) * 1000UL;
+  return static_cast<uint32_t>(now - lastPageChangeMs) >= intervalMs &&
+         static_cast<uint32_t>(now - lastTouchMs) >= intervalMs;
+}
+
 }  // namespace cs
