@@ -78,12 +78,8 @@ Omission rules:
   - Trigger when the full window exists and its average discharge > `dis_amps` (default 4.0 A, range 0.5–50).
   - Clear when the average stays < 0.8 × `dis_amps` for 15 consecutive minutes; that sends the all-clear.
   - After a trigger, don't trigger again for 60 minutes even if the condition cleared and returned.
-- **Morning report:** once per local day, at the first sample at or after `report_hour`:00 local time (default 8, range 4–12). Requires valid local time.
-- **Evening report:** once per local day, when all of these hold:
-  - local time ≥ 14:00;
-  - PV exceeded 5 W earlier that day;
-  - PV has been < 5 W for 30 consecutive minutes.
-  Accepted limitation: a very dark afternoon can send it early.
+- **Morning report:** once per local day, at the first sample at or after `report_hour`:00 local time (default 10, range 4–12). Requires valid local time.
+- **Evening report:** once per local day, requiring valid local time and that PV exceeded 5 W earlier that day. It is sent at the first sample at or after `evening_hour`:00 local time (default 20, range 16–22), when PV has been < 5 W for the last 30 consecutive minutes. If production is still going on at that hour (e.g. a summer evening), it waits until PV has been < 5 W for 30 minutes, and goes out at 23:00 at the latest.
 - **Batch:** every `batch_min` minutes (default 30; options 15, 30, 60). It contains the 5-minute records not yet sent.
 
 ### Offline behaviour
@@ -152,7 +148,8 @@ The setup page gets a new **Online** section. All values live in the NVS namespa
 | Time zone override | `tz_override` | empty (automatic) |
 | Drain limit (A) | `dis_amps` | 4.0 |
 | Drain window (min) | `dis_win_min` | 45 |
-| Morning report hour | `report_hour` | 8 |
+| Morning report hour | `report_hour` | 10 |
+| Evening report hour | `evening_hour` | 20 |
 | Batch interval (min) | `batch_min` | 30 |
 | Days to average | `days_avg` | 3 |
 
@@ -210,7 +207,7 @@ Header-only, Arduino-free, namespace `cs`, unit-tested natively like `chargescre
 - `DayStats` plus an integrator;
 - `CapacityLearner`;
 - `daysRemaining`;
-- `SunsetDetector`;
+- `SunsetDetector` (evening report timing);
 - the report text builders (morning, evening, alert, clear, delayed suffix);
 - the batch JSON builder;
 - the ntfy and generic envelope builders;
@@ -279,7 +276,7 @@ Backoff after a failed attempt: 1, 2, 5, 10, then 30 minutes. A success resets i
   - PV first and last minute and peak.
 - `CapacityLearner`: learns at 78 % / 44 Ah → 200 Ah; ignores SOC > 90 % and 102.3; smoothing.
 - `daysRemaining`: both figures; solar covers usage; fewer days than `days_avg`; no complete day.
-- `SunsetDetector`: not before 14:00; needs prior production; 30 min hold; once per day.
+- `SunsetDetector`: not before `evening_hour`; needs prior production that day; waits while PV ≥ 5 W until 30 min below; forced at 23:00; once per day.
 - Text builders: the exact example texts above, with each omission rule and the delayed suffix.
 - Batch JSON: the field omission, rounding, and 12 records under 4096 bytes.
 - Envelopes: ntfy topic extraction from the URL; generic shape; sink detection for `ntfy.sh`, a subdomain, and a non-ntfy URL.
