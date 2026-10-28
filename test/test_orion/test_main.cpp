@@ -87,6 +87,14 @@ static void test_plausible_orion_xs() {
   TEST_ASSERT_FALSE(cs::plausibleOrionXs(3, 14.2f, 600.0f));
 }
 
+static void test_orion_zero_input_accepted_when_off() {
+  TEST_ASSERT_TRUE(cs::plausibleOrionXs(0, 12.9f, 0.0f));
+}
+
+static void test_orion_zero_input_rejected_when_not_off() {
+  TEST_ASSERT_FALSE(cs::plausibleOrionXs(3, 12.9f, 0.0f));
+}
+
 int main(int, char **) {
   UNITY_BEGIN();
   RUN_TEST(test_parse_orion_xs_values);
@@ -96,5 +104,7 @@ int main(int, char **) {
   RUN_TEST(test_charger_state_text);
   RUN_TEST(test_charger_state_known);
   RUN_TEST(test_plausible_orion_xs);
+  RUN_TEST(test_orion_zero_input_accepted_when_off);
+  RUN_TEST(test_orion_zero_input_rejected_when_not_off);
   return UNITY_END();
 }

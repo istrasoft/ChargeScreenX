@@ -327,10 +327,13 @@ inline bool plausibleSolar(uint8_t deviceState, float batteryVoltage, float pvPo
   return chargerStateKnown(deviceState) && plausibleOptionalVoltage(batteryVoltage) && pvOk;
 }
 
-// NaN voltages mean "not available" and are accepted.
+// NaN voltages mean "not available" and are accepted. A disconnected input may
+// report 0 V instead of NaN; that is accepted only when the state is Off (0),
+// so the off-reason page still shows. Output voltage stays strict.
 inline bool plausibleOrionXs(uint8_t state, float outputVoltage, float inputVoltage) {
-  return chargerStateKnown(state) && plausibleOptionalVoltage(outputVoltage) &&
-         plausibleOptionalVoltage(inputVoltage);
+  bool inputOk = plausibleOptionalVoltage(inputVoltage) ||
+                 (state == 0 && inputVoltage >= 0.0f && inputVoltage <= 70.0f);
+  return chargerStateKnown(state) && plausibleOptionalVoltage(outputVoltage) && inputOk;
 }
 
 }  // namespace cs
