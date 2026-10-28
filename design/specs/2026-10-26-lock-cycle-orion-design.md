@@ -144,4 +144,5 @@ The plausibility rules in section 2 are replaced by (checks in `cs::`, unit-test
 - **Orion XS** (`cs::plausibleOrionXs(state, outputVoltage, inputVoltage)`): known state, and output and input voltage each NaN or 5.0–70.0 V.
 
 A rejected advert behaves as before: error `implausible`, it doesn't count towards a lock, and it doesn't replace valid data.
+
 A 0 V Orion input is accepted when the state is Off (0), so a disconnected input still shows its off-reason.
