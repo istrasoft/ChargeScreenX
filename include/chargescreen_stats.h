@@ -424,4 +424,337 @@ inline bool sunsetDue(int32_t eveningSentDay, const DayStats &today, int32_t loc
   return localMinute - today.pvLastMinute >= SUNSET_QUIET_MINUTES;
 }
 
+// ---------------------------------------------------------------- text output
+
+// Appends into a caller-provided buffer; on overflow the text is cut at the
+// last complete piece and `overflow` is set.
+struct TextWriter {
+  char *buf;
+  size_t cap;
+  size_t len = 0;
+  bool overflow = false;
+
+  TextWriter(char *buffer, size_t capacity) : buf(buffer), cap(capacity) {
+    if (cap) {
+      buf[0] = '\0';
+    }
+  }
+
+  void putChar(char c) {
+    if (overflow || len + 1 >= cap) {
+      overflow = true;
+      return;
+    }
+    buf[len++] = c;
+    buf[len] = '\0';
+  }
+
+  void putStr(const char *s) {
+    while (*s && !overflow) {
+      putChar(*s++);
+    }
+  }
+
+  void putf(const char *fmt, ...) __attribute__((format(printf, 2, 3))) {
+    if (overflow || cap == 0) {
+      overflow = true;
+      return;
+    }
+    va_list args;
+    va_start(args, fmt);
+    int n = vsnprintf(buf + len, cap - len, fmt, args);
+    va_end(args);
+    if (n < 0 || static_cast<size_t>(n) >= cap - len) {
+      overflow = true;
+      buf[len] = '\0';
+      return;
+    }
+    len += static_cast<size_t>(n);
+  }
+
+  // JSON string content (without the surrounding quotes).
+  void putEscaped(const char *s) {
+    for (; *s && !overflow; ++s) {
+      unsigned char c = static_cast<unsigned char>(*s);
+      if (c == '"' || c == '\\') {
+        putChar('\\');
+        putChar(static_cast<char>(c));
+      } else if (c == '\n') {
+        putStr("\\n");
+      } else if (c < 0x20) {
+        putf("\\u%04x", c);
+      } else {
+        putChar(static_cast<char>(c));
+      }
+    }
+  }
+
+  size_t result() const {
+    return overflow ? 0 : len;
+  }
+};
+
+// ---------------------------------------------------------------- messages
+
+enum class MsgKind : uint8_t { Alert = 0, Clear = 1, Morning = 2, Evening = 3, Batch = 4, Test = 5 };
+
+constexpr const char *TEST_BODY = "Online sending works.";
+
+inline const char *kindName(MsgKind k) {
+  switch (k) {
+    case MsgKind::Alert:
+      return "alert";
+    case MsgKind::Clear:
+      return "clear";
+    case MsgKind::Morning:
+      return "morning";
+    case MsgKind::Evening:
+      return "evening";
+    case MsgKind::Batch:
+      return "batch";
+    default:
+      return "test";
+  }
+}
+
+inline const char *kindTitle(MsgKind k) {
+  switch (k) {
+    case MsgKind::Alert:
+      return "High battery drain";
+    case MsgKind::Clear:
+      return "Drain back to normal";
+    case MsgKind::Morning:
+      return "Morning battery report";
+    case MsgKind::Evening:
+      return "Solar today";
+    case MsgKind::Batch:
+      return "ChargeScreen data";
+    default:
+      return "ChargeScreen test";
+  }
+}
+
+// ntfy tag; empty = no tag.
+inline const char *kindTag(MsgKind k) {
+  switch (k) {
+    case MsgKind::Alert:
+      return "warning";
+    case MsgKind::Clear:
+      return "white_check_mark";
+    case MsgKind::Morning:
+      return "sunny";
+    case MsgKind::Evening:
+      return "city_sunset";
+    default:
+      return "";
+  }
+}
+
+// ntfy levels: 1 = min (silent), 3 = default, 4 = high.
+inline uint8_t kindPriority(MsgKind k) {
+  return k == MsgKind::Alert ? 4 : (k == MsgKind::Batch ? 1 : 3);
+}
+
+constexpr size_t MSG_TITLE_LEN = 48;
+constexpr size_t MSG_BODY_LEN = 320;
+
+// Stored as-is in /outbox.bin.
+struct Message {
+  uint8_t kind = 0;
+  uint8_t priority = 3;
+  uint16_t boot = 0;        // boot id when queued; eventMs is only meaningful in that boot
+  uint32_t eventUnix = 0;   // 0 = clock unknown when it happened
+  uint32_t eventMs = 0;     // millis() when it happened
+  char title[MSG_TITLE_LEN] = {};
+  char body[MSG_BODY_LEN] = {};
+};
+static_assert(sizeof(Message) == 380, "Message layout is stored on flash");
+
+inline void messageInit(Message &m, MsgKind kind, uint16_t boot, uint32_t unixOr0, uint32_t nowMs) {
+  m = Message();
+  m.kind = static_cast<uint8_t>(kind);
+  m.priority = kindPriority(kind);
+  m.boot = boot;
+  m.eventUnix = clockValid(unixOr0) ? unixOr0 : 0;
+  m.eventMs = nowMs;
+  snprintf(m.title, sizeof(m.title), "%s", kindTitle(kind));
+}
+
+// ---------------------------------------------------------------- report text
+
+inline void putDays(TextWriter &w, float days) {
+  if (!(days <= 30.0f)) {
+    w.putStr("more than 30 days");
+  } else {
+    w.putf("about %.1f days", days);
+  }
+}
+
+inline void putBatterySentence(TextWriter &w, float soc, float remaining) {
+  if (!socKnown(soc)) {
+    return;
+  }
+  w.putf(" Battery %.0f%%", soc);
+  if (std::isfinite(remaining)) {
+    w.putf(" (%.0f Ah left)", remaining);
+  }
+  w.putChar('.');
+}
+
+inline size_t buildAlertBody(char *out, size_t cap, float avgA, uint16_t windowMin, float limitA, float soc,
+                             float remaining) {
+  TextWriter w(out, cap);
+  w.putf("Averaging %.1f A over the last %u min (limit %.1f A).", avgA, static_cast<unsigned>(windowMin), limitA);
+  putBatterySentence(w, soc, remaining);
+  return w.result();
+}
+
+inline size_t buildClearBody(char *out, size_t cap, float avgA, float soc) {
+  TextWriter w(out, cap);
+  w.putf("%.1f A average.", avgA);
+  putBatterySentence(w, soc, NAN);
+  return w.result();
+}
+
+inline bool shownAh(float v) {
+  return std::isfinite(v) && std::fabs(v) >= 0.05f;
+}
+
+// yesterday may be null (no complete record of yesterday).
+inline size_t buildMorningBody(char *out, size_t cap, float soc, float remaining, const DaysEstimate &est,
+                               const DayStats *yesterday, bool hasSolarKey, bool hasOrionKey) {
+  TextWriter w(out, cap);
+  w.putf("%.0f%%", soc);
+  if (std::isfinite(remaining)) {
+    w.putf(" (%.0f Ah left)", remaining);
+  }
+  if (est.valid) {
+    w.putStr("\nAt the last ");
+    if (est.daysUsed == 1) {
+      w.putStr("day's");
+    } else {
+      w.putf("%u days'", static_cast<unsigned>(est.daysUsed));
+    }
+    w.putStr(" rate: ");
+    if (est.showSolar) {
+      if (est.solarCovers) {
+        w.putStr("solar covers your usage");
+      } else {
+        putDays(w, est.withSolar);
+        w.putStr(" with solar");
+      }
+      w.putStr(", ");
+      putDays(w, est.noSun);
+      w.putStr(" with no sun.");
+    } else {
+      putDays(w, est.noSun);
+      w.putChar('.');
+    }
+  }
+  if (yesterday) {
+    w.putf("\nYesterday: used %.0f Ah", dayUsedAh(*yesterday));
+    if (hasSolarKey && shownAh(yesterday->solarAh)) {
+      w.putf(", solar +%.0f Ah", yesterday->solarAh);
+    }
+    if (hasOrionKey && shownAh(yesterday->orionAh)) {
+      w.putf(", Orion +%.0f Ah", yesterday->orionAh);
+    }
+    w.putChar('.');
+  }
+  return w.result();
+}
+
+inline size_t buildEveningBody(char *out, size_t cap, const DayStats &d) {
+  TextWriter w(out, cap);
+  char peak[6];
+  char first[6];
+  char last[6];
+  formatHhMm(d.pvPeakMinute < 0 ? 0 : static_cast<uint16_t>(d.pvPeakMinute), peak);
+  formatHhMm(d.pvFirstMinute < 0 ? 0 : static_cast<uint16_t>(d.pvFirstMinute), first);
+  formatHhMm(d.pvLastMinute < 0 ? 0 : static_cast<uint16_t>(d.pvLastMinute), last);
+  int duration = d.pvLastMinute - d.pvFirstMinute;
+  if (duration < 0) {
+    duration = 0;
+  }
+  w.putf("+%.0f Ah (%.0f Wh), peak %.0f W at %s", d.solarAh, d.solarWh, d.pvPeakW, peak);
+  w.putf("\nProducing from %s to %s (%d h %d m)", first, last, duration / 60, duration % 60);
+  return w.result();
+}
+
+// Empty when the message is not late. Uses HH:MM when both clocks and the
+// local offset are known, "N min ago" when only millis() is comparable
+// (same boot), and a bare "(delayed)" when neither is.
+inline size_t formatDelayedSuffix(char *out, size_t cap, uint32_t nowUnix, uint32_t eventUnix, bool offsetKnown,
+                                  int32_t offsetS, bool sameBoot, uint32_t nowMs, uint32_t eventMs) {
+  TextWriter w(out, cap);
+  bool haveClock = clockValid(nowUnix) && clockValid(eventUnix);
+  uint32_t elapsed;
+  if (haveClock) {
+    elapsed = nowUnix >= eventUnix ? nowUnix - eventUnix : 0;
+  } else if (sameBoot) {
+    elapsed = static_cast<uint32_t>(nowMs - eventMs) / 1000U;
+  } else {
+    w.putStr(" (delayed)");
+    return w.result();
+  }
+  if (elapsed <= DELAYED_AFTER_S) {
+    return 0;
+  }
+  if (haveClock && offsetKnown) {
+    char hm[6];
+    formatHhMm(localMinuteOfDay(eventUnix, offsetS), hm);
+    w.putf(" (delayed, happened %s)", hm);
+  } else {
+    w.putf(" (delayed, happened %lu min ago)", static_cast<unsigned long>(elapsed / 60U));
+  }
+  return w.result();
+}
+
+// Appends suffix to the first line of body. False if it does not fit.
+inline bool insertAfterFirstLine(char *body, size_t cap, const char *suffix) {
+  size_t bodyLen = strlen(body);
+  size_t suffixLen = strlen(suffix);
+  if (suffixLen == 0) {
+    return true;
+  }
+  if (bodyLen + suffixLen + 1 > cap) {
+    return false;
+  }
+  const char *newline = strchr(body, '\n');
+  size_t at = newline ? static_cast<size_t>(newline - body) : bodyLen;
+  memmove(body + at + suffixLen, body + at, bodyLen - at + 1);
+  memcpy(body + at, suffix, suffixLen);
+  return true;
+}
+
+// ---------------------------------------------------------------- info screen
+
+enum class OnlineState : uint8_t { Off = 0, Waiting = 1, NoWifi = 2, Sent = 3, Error = 4 };
+
+// localMinute < 0 when the local time of the last attempt is unknown.
+inline void onlineStatusText(OnlineState state, int16_t localMinute, char *out, size_t cap) {
+  TextWriter w(out, cap);
+  char hm[6] = "--:--";
+  if (localMinute >= 0) {
+    formatHhMm(static_cast<uint16_t>(localMinute), hm);
+  }
+  switch (state) {
+    case OnlineState::Off:
+      w.putStr("Off");
+      break;
+    case OnlineState::Waiting:
+      w.putStr("Waiting");
+      break;
+    case OnlineState::NoWifi:
+      w.putStr("No WiFi");
+      break;
+    case OnlineState::Sent:
+      w.putf("Sent %s", hm);
+      break;
+    case OnlineState::Error:
+      w.putf("Error %s", hm);
+      break;
+  }
+}
+
 }  // namespace cs
