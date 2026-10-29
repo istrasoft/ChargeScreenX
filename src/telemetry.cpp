@@ -4,6 +4,8 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 
+#include "netlink.h"
+
 namespace {
 
 constexpr const char *CACHE_PATH = "/tx_cache.bin";
@@ -371,4 +373,176 @@ bool storeSaveDays(const cs::DayHistory &days) {
             f.write(reinterpret_cast<const uint8_t *>(&days), sizeof(days)) == sizeof(days);
   f.close();
   return ok;
+}
+
+// ---------------------------------------------------------------- sampling and triggers (loop() only)
+
+namespace {
+
+Preferences *telemetryPrefs = nullptr;
+cs::OnlineSettings telemetrySettings;
+bool telemetryEnabled = false;
+cs::DrainMonitor drainMonitor;
+cs::CapacityLearner capacityLearner;
+float storedCapacityAh = NAN;
+cs::DayHistory dayHistory;
+cs::RecordBuilder recordBuilder;
+bool recordOpen = false;
+uint32_t recordStartMs = 0;
+uint32_t lastSampleMs = 0;
+uint8_t samplesThisMinute = 0;
+
+void queueMessage(const cs::Message &msg) {
+  if (storeEnqueueMessage(msg)) {
+    Serial.printf("Online: queued %s\n", cs::kindName(static_cast<cs::MsgKind>(msg.kind)));
+    netlinkNotify();
+  }
+}
+
+void onMinute(const cs::Sample &sample, uint32_t unixOr0, uint32_t nowMs) {
+  cs::DrainEvent event = cs::drainCloseMinute(drainMonitor, telemetrySettings.disAmps, telemetrySettings.disWinMin);
+
+  if (sample.shuntValid && cs::capacityUpdate(capacityLearner, sample.soc, sample.consumedAh) &&
+      cs::capacityShouldPersist(capacityLearner.capacityAh, storedCapacityAh)) {
+    telemetryPrefs->putFloat("cap_ah", capacityLearner.capacityAh);
+    storedCapacityAh = capacityLearner.capacityAh;
+    Serial.printf("Online: capacity %.0f Ah saved\n", capacityLearner.capacityAh);
+  }
+
+  if (event == cs::DrainEvent::None) {
+    return;
+  }
+  float average = cs::drainWindowAverage(drainMonitor, telemetrySettings.disWinMin);
+  cs::Message msg;
+  if (event == cs::DrainEvent::Trigger) {
+    cs::messageInit(msg, cs::MsgKind::Alert, storeBootId(), unixOr0, nowMs);
+    cs::buildAlertBody(msg.body, sizeof(msg.body), average, telemetrySettings.disWinMin, telemetrySettings.disAmps,
+                       sample.soc, cs::remainingAh(capacityLearner, sample.soc));
+  } else {
+    cs::messageInit(msg, cs::MsgKind::Clear, storeBootId(), unixOr0, nowMs);
+    cs::buildClearBody(msg.body, sizeof(msg.body), average, sample.soc);
+  }
+  queueMessage(msg);
+}
+
+void checkReports(const cs::Sample &sample, int32_t today, uint16_t minute, uint32_t unixOr0, uint32_t nowMs,
+                  bool hasSolarKey, bool hasOrionKey) {
+  if (cs::morningDue(dayHistory.morningSentDay, today, minute, telemetrySettings.reportHour) && sample.shuntValid &&
+      cs::socKnown(sample.soc)) {
+    float remaining = cs::remainingAh(capacityLearner, sample.soc);
+    cs::DaysEstimate estimate = cs::daysRemaining(dayHistory, telemetrySettings.daysAvg, remaining, hasSolarKey);
+    const cs::DayStats *yesterday = cs::dayHistoryFind(dayHistory, today - 1);
+    if (yesterday && !cs::dayComplete(*yesterday)) {
+      yesterday = nullptr;
+    }
+    cs::Message msg;
+    cs::messageInit(msg, cs::MsgKind::Morning, storeBootId(), unixOr0, nowMs);
+    if (cs::buildMorningBody(msg.body, sizeof(msg.body), sample.soc, remaining, estimate, yesterday, hasSolarKey,
+                             hasOrionKey) > 0) {
+      queueMessage(msg);
+    }
+    dayHistory.morningSentDay = today;
+    storeSaveDays(dayHistory);
+  }
+
+  if (cs::sunsetDue(dayHistory.eveningSentDay, dayHistory.current, today, minute, telemetrySettings.eveningHour)) {
+    cs::Message msg;
+    cs::messageInit(msg, cs::MsgKind::Evening, storeBootId(), unixOr0, nowMs);
+    if (cs::buildEveningBody(msg.body, sizeof(msg.body), dayHistory.current) > 0) {
+      queueMessage(msg);
+    }
+    dayHistory.eveningSentDay = today;
+    storeSaveDays(dayHistory);
+  }
+}
+
+}  // namespace
+
+void telemetryBegin(Preferences &prefs) {
+  telemetryPrefs = &prefs;
+  float stored = prefs.getFloat("cap_ah", NAN);
+  capacityLearner.capacityAh = (std::isfinite(stored) && stored > 0.0f) ? stored : NAN;
+  storedCapacityAh = capacityLearner.capacityAh;
+  storeBegin();
+  if (!storeLoadDays(dayHistory)) {
+    dayHistory = cs::DayHistory();
+  }
+}
+
+void telemetryConfigure(const cs::OnlineSettings &settings, bool enabled) {
+  telemetrySettings = settings;
+  telemetryEnabled = enabled;
+}
+
+bool telemetrySampleDue(uint32_t nowMs) {
+  return lastSampleMs == 0 || nowMs - lastSampleMs >= cs::SAMPLE_PERIOD_MS;
+}
+
+void telemetryLoop(const cs::Sample &sample, bool demoMode, bool hasSolarKey, bool hasOrionKey) {
+  uint32_t nowMs = millis();
+  uint32_t dtS = lastSampleMs == 0 ? cs::SAMPLE_PERIOD_MS / 1000 : (nowMs - lastSampleMs + 500) / 1000;
+  if (dtS > 30) {
+    dtS = 30;  // the loop was blocked; do not integrate across the gap
+  }
+  lastSampleMs = nowMs;
+  if (!telemetryEnabled || demoMode) {
+    recordOpen = false;
+    samplesThisMinute = 0;
+    return;
+  }
+
+  cs::ClockNow clock = clockNow();
+  uint32_t unixOr0 = clock.utcValid ? clock.unixUtc : 0;
+
+  if (!recordOpen) {
+    cs::recordStart(recordBuilder, unixOr0, nowMs, storeBootId());
+    recordStartMs = nowMs;
+    recordOpen = true;
+  }
+  cs::recordAdd(recordBuilder, sample);
+  if (sample.shuntValid) {
+    cs::drainAddSample(drainMonitor, sample.currentA);
+  }
+
+  int32_t today = cs::NO_DAY;
+  uint16_t minute = 0;
+  if (clock.localValid) {
+    today = cs::localDayNumber(clock.unixUtc, clock.offsetS);
+    minute = cs::localMinuteOfDay(clock.unixUtc, clock.offsetS);
+    if (dayHistory.current.day != today) {
+      cs::dayHistoryRoll(dayHistory, today);
+      storeSaveDays(dayHistory);
+    }
+    cs::dayAddSample(dayHistory.current, sample, dtS, minute);
+  }
+
+  if (++samplesThisMinute >= cs::SAMPLES_PER_MINUTE) {
+    samplesThisMinute = 0;
+    onMinute(sample, unixOr0, nowMs);
+  }
+
+  if (clock.localValid) {
+    checkReports(sample, today, minute, unixOr0, nowMs, hasSolarKey, hasOrionKey);
+  }
+
+  if (nowMs - recordStartMs >= cs::RECORD_PERIOD_MS) {
+    storeAppendRecord(cs::recordClose(recordBuilder));
+    cs::recordStart(recordBuilder, unixOr0, nowMs, storeBootId());
+    recordStartMs = nowMs;
+    if (clock.localValid) {
+      storeSaveDays(dayHistory);
+    }
+  }
+}
+
+bool telemetryQueueTest() {
+  cs::ClockNow clock = clockNow();
+  cs::Message msg;
+  cs::messageInit(msg, cs::MsgKind::Test, storeBootId(), clock.utcValid ? clock.unixUtc : 0, millis());
+  snprintf(msg.body, sizeof(msg.body), "%s", cs::TEST_BODY);
+  if (!storeEnqueueMessage(msg)) {
+    return false;
+  }
+  netlinkNotify();
+  return true;
 }

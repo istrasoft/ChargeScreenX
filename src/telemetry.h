@@ -21,3 +21,10 @@ uint8_t storeMessageCount();
 uint32_t storeUnsentRecordCount();
 bool storeLoadDays(cs::DayHistory &days);
 bool storeSaveDays(const cs::DayHistory &days);
+
+// Sampling and triggers. Called from loop() only.
+void telemetryBegin(Preferences &prefs);
+void telemetryConfigure(const cs::OnlineSettings &settings, bool enabled);
+bool telemetrySampleDue(uint32_t nowMs);
+void telemetryLoop(const cs::Sample &sample, bool demoMode, bool hasSolarKey, bool hasOrionKey);
+bool telemetryQueueTest();
