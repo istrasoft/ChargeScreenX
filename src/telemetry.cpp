@@ -396,6 +396,8 @@ void queueMessage(const cs::Message &msg) {
   if (storeEnqueueMessage(msg)) {
     Serial.printf("Online: queued %s\n", cs::kindName(static_cast<cs::MsgKind>(msg.kind)));
     netlinkNotify();
+  } else {
+    Serial.printf("Online: queue failed for %s\n", cs::kindName(static_cast<cs::MsgKind>(msg.kind)));
   }
 }
 
@@ -403,7 +405,7 @@ void onMinute(const cs::Sample &sample, uint32_t unixOr0, uint32_t nowMs) {
   cs::DrainEvent event = cs::drainCloseMinute(drainMonitor, telemetrySettings.disAmps, telemetrySettings.disWinMin);
 
   if (sample.shuntValid && cs::capacityUpdate(capacityLearner, sample.soc, sample.consumedAh) &&
-      cs::capacityShouldPersist(capacityLearner.capacityAh, storedCapacityAh)) {
+      cs::capacityShouldPersist(capacityLearner.capacityAh, storedCapacityAh) && telemetryPrefs) {
     telemetryPrefs->putFloat("cap_ah", capacityLearner.capacityAh);
     storedCapacityAh = capacityLearner.capacityAh;
     Serial.printf("Online: capacity %.0f Ah saved\n", capacityLearner.capacityAh);
@@ -467,6 +469,9 @@ void telemetryBegin(Preferences &prefs) {
   if (!storeLoadDays(dayHistory)) {
     dayHistory = cs::DayHistory();
   }
+  if (dayHistory.count > cs::DAY_HISTORY_DAYS) {
+    dayHistory.count = cs::DAY_HISTORY_DAYS;
+  }
 }
 
 void telemetryConfigure(const cs::OnlineSettings &settings, bool enabled) {
@@ -481,14 +486,21 @@ bool telemetrySampleDue(uint32_t nowMs) {
 void telemetryLoop(const cs::Sample &sample, bool demoMode, bool hasSolarKey, bool hasOrionKey) {
   uint32_t nowMs = millis();
   uint32_t dtS = lastSampleMs == 0 ? cs::SAMPLE_PERIOD_MS / 1000 : (nowMs - lastSampleMs + 500) / 1000;
-  if (dtS > 30) {
-    dtS = 30;  // the loop was blocked; do not integrate across the gap
+  if (dtS > 60) {
+    dtS = 60;  // the loop was blocked; do not integrate across the gap
   }
   lastSampleMs = nowMs;
-  if (!telemetryEnabled || demoMode) {
+  static bool wasActive = false;
+  const bool active = telemetryEnabled && !demoMode;
+  if (!active) {
+    wasActive = false;
     recordOpen = false;
     samplesThisMinute = 0;
     return;
+  }
+  if (!wasActive) {
+    drainMonitor = cs::DrainMonitor();  // a window from before the pause must not fire a false alert
+    wasActive = true;
   }
 
   cs::ClockNow clock = clockNow();
@@ -509,7 +521,8 @@ void telemetryLoop(const cs::Sample &sample, bool demoMode, bool hasSolarKey, bo
   if (clock.localValid) {
     today = cs::localDayNumber(clock.unixUtc, clock.offsetS);
     minute = cs::localMinuteOfDay(clock.unixUtc, clock.offsetS);
-    if (dayHistory.current.day != today) {
+    // Never roll backward (offset decreased near midnight): keep integrating into current.
+    if (dayHistory.current.day == cs::NO_DAY || today > dayHistory.current.day) {
       cs::dayHistoryRoll(dayHistory, today);
       storeSaveDays(dayHistory);
     }
