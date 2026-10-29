@@ -1213,7 +1213,16 @@ inline bool parseTimeapiOffset(const char *json, int32_t &offsetS) {
   if (!current || *current != '{') {
     return false;
   }
-  return jsonReadOffset(jsonValueAfterKey(current, "seconds"), offsetS);
+  // Bound the search to this object (no nested braces in real responses).
+  const char *close = strchr(current, '}');
+  if (!close) {
+    return false;
+  }
+  const char *seconds = jsonValueAfterKey(current, "seconds");
+  if (!seconds || seconds > close) {
+    return false;
+  }
+  return jsonReadOffset(seconds, offsetS);
 }
 
 // ip-api.com /json/?fields=status,message,offset: offset (includes daylight

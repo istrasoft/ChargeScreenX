@@ -44,6 +44,13 @@ static void test_timeapi_rejects_error_and_garbage() {
   TEST_ASSERT_EQUAL_INT32(99, offset);
 }
 
+static void test_timeapi_ignores_seconds_outside_current_offset() {
+  int32_t offset = 99;
+  TEST_ASSERT_FALSE(cs::parseTimeapiOffset(
+      "{\"currentUtcOffset\":{\"x\":1},\"standardUtcOffset\":{\"seconds\":3600}}", offset));
+  TEST_ASSERT_EQUAL_INT32(99, offset);
+}
+
 static void test_ipapi_offset() {
   int32_t offset = 0;
   TEST_ASSERT_TRUE(cs::parseIpApiOffset(IPAPI_BRUSSELS, offset));
@@ -195,6 +202,7 @@ int main(int, char **) {
   UNITY_BEGIN();
   RUN_TEST(test_timeapi_offset_uses_current_offset);
   RUN_TEST(test_timeapi_rejects_error_and_garbage);
+  RUN_TEST(test_timeapi_ignores_seconds_outside_current_offset);
   RUN_TEST(test_ipapi_offset);
   RUN_TEST(test_json_key_finder);
   RUN_TEST(test_plain_ip_and_timeapi_url);

@@ -3,6 +3,7 @@
 #include <HTTPClient.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <esp_heap_caps.h>
 #include <esp_sntp.h>
 #include <time.h>
 
@@ -193,11 +194,12 @@ void refreshOffset() {
 }
 
 void logHeap(const char *what, int code) {
-  Serial.printf("Online: %s -> HTTP %d, free heap %u, min %u, stack left %u\n",
+  Serial.printf("Online: %s -> HTTP %d, free heap %u, min %u, largest %u, stack left %u\n",
                 what,
                 code,
                 ESP.getFreeHeap(),
                 ESP.getMinFreeHeap(),
+                static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)),
                 static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
 }
 

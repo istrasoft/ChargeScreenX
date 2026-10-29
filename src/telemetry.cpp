@@ -224,7 +224,13 @@ bool storePeekMessage(cs::Message &msg, uint32_t &id) {
     return false;
   }
   id = outboxHeader.queue.ids[slot];
-  return readAt(OUTBOX_PATH, outboxOffset(static_cast<uint8_t>(slot)), &msg, sizeof(msg));
+  if (!readAt(OUTBOX_PATH, outboxOffset(static_cast<uint8_t>(slot)), &msg, sizeof(msg))) {
+    return false;
+  }
+  // A corrupted slot must not cause string overreads.
+  msg.title[sizeof(msg.title) - 1] = '\0';
+  msg.body[sizeof(msg.body) - 1] = '\0';
+  return true;
 }
 
 bool storePopMessage(uint32_t id) {
@@ -429,6 +435,9 @@ void onMinute(const cs::Sample &sample, uint32_t unixOr0, uint32_t nowMs) {
 
 void checkReports(const cs::Sample &sample, int32_t today, uint16_t minute, uint32_t unixOr0, uint32_t nowMs,
                   bool hasSolarKey, bool hasOrionKey) {
+  if (today < dayHistory.current.day) {
+    return;  // never roll backward
+  }
   if (cs::morningDue(dayHistory.morningSentDay, today, minute, telemetrySettings.reportHour) && sample.shuntValid &&
       cs::socKnown(sample.soc)) {
     float remaining = cs::remainingAh(capacityLearner, sample.soc);
