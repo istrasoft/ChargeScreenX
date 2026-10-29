@@ -13,6 +13,8 @@
 #include "aa_font.h"
 #include "build_version.h"
 #include "chargescreen_logic.h"
+#include "netlink.h"
+#include "telemetry.h"
 
 static constexpr const char *SETTINGS_AP_SSID = "ChargeScreen";
 static constexpr const char *SETTINGS_AP_PASSWORD = "";
@@ -269,6 +271,11 @@ static float demoOrionInputCurrent = 35.5f;
 static uint16_t solarArrayWatts = DEFAULT_SOLAR_ARRAY_WATTS;
 static uint16_t cycleSeconds = 0;
 static uint32_t lastPageChangeMs = 0;
+static String onlineWifiSsid[2];
+static String onlineWifiPass[2];
+static String onlinePostUrl;
+static String onlineTzOverride;
+static cs::OnlineSettings onlineSettings;
 static String settingsMessage;
 static bool screenAwake = true;
 static uint32_t lastTouchActivityMs = 0;
@@ -597,6 +604,39 @@ static cs::PageAvailability pageAvailability() {
   return cs::PageAvailability{demoModeEnabled, storedSolarKey.length() > 0, storedOrionKey.length() > 0};
 }
 
+static bool onlineEnabled() {
+  return cs::onlineConfigured(onlinePostUrl.c_str(), onlineWifiSsid[0].c_str(), onlineWifiSsid[1].c_str());
+}
+
+static void applyOnlineConfig() {
+  NetConfig config = {};
+  for (int n = 0; n < 2; n++) {
+    snprintf(config.ssid[n], sizeof(config.ssid[n]), "%s", onlineWifiSsid[n].c_str());
+    snprintf(config.pass[n], sizeof(config.pass[n]), "%s", onlineWifiPass[n].c_str());
+  }
+  snprintf(config.url, sizeof(config.url), "%s", onlinePostUrl.c_str());
+  snprintf(config.tz, sizeof(config.tz), "%s", onlineTzOverride.c_str());
+  config.batchMin = onlineSettings.batchMin;
+  config.enabled = onlineEnabled();
+  netlinkConfigure(config);
+  telemetryConfigure(onlineSettings, config.enabled);
+}
+
+static String onlineStatusLine() {
+  if (!onlineEnabled() || demoModeEnabled) {
+    return "Off";
+  }
+  OnlineStatus status = netlinkStatus();
+  cs::ClockNow clock = clockNow();
+  int16_t minute = -1;
+  if (cs::clockValid(status.lastUnix) && clock.localValid) {
+    minute = static_cast<int16_t>(cs::localMinuteOfDay(status.lastUnix, clock.offsetS));
+  }
+  char text[16];
+  cs::onlineStatusText(status.state, minute, text, sizeof(text));
+  return text;
+}
+
 static void loadStoredSecrets() {
   secrets.begin("victron", false);
   storedVictronKey = secrets.getString("shunt_key", "");
@@ -611,6 +651,18 @@ static void loadStoredSecrets() {
   showValueLabels = secrets.getBool("value_labels", true);
   showValueGrid = secrets.getBool("value_grid", true);
   cycleSeconds = cs::sanitiseCycleSeconds(secrets.getUShort("cycle_secs", 0));
+  onlineWifiSsid[0] = secrets.getString("wifi1_ssid", "");
+  onlineWifiPass[0] = secrets.getString("wifi1_pass", "");
+  onlineWifiSsid[1] = secrets.getString("wifi2_ssid", "");
+  onlineWifiPass[1] = secrets.getString("wifi2_pass", "");
+  onlinePostUrl = secrets.getString("post_url", "");
+  onlineTzOverride = secrets.getString("tz_override", "");
+  onlineSettings.disAmps = cs::sanitiseDisAmps(secrets.getFloat("dis_amps", 4.0f));
+  onlineSettings.disWinMin = cs::sanitiseDisWinMin(secrets.getUShort("dis_win_min", 45));
+  onlineSettings.reportHour = cs::sanitiseReportHour(secrets.getUChar("report_hour", 10));
+  onlineSettings.eveningHour = cs::sanitiseEveningHour(secrets.getUChar("evening_hour", 20));
+  onlineSettings.batchMin = cs::sanitiseBatchMin(secrets.getUChar("batch_min", 30));
+  onlineSettings.daysAvg = cs::sanitiseDaysAvg(secrets.getUChar("days_avg", 3));
   solarArrayWatts = secrets.getUShort("solar_watts", DEFAULT_SOLAR_ARRAY_WATTS);
   uint16_t sanitisedSolarArrayWatts = sanitiseSolarArrayWatts(solarArrayWatts);
   if (sanitisedSolarArrayWatts != solarArrayWatts) {
@@ -1900,6 +1952,94 @@ static String maskedPasswordText(const String &password) {
   return password.length() ? "saved" : "default 123123";
 }
 
+static String htmlAttr(const String &value) {
+  String out;
+  out.reserve(value.length() + 8);
+  for (size_t i = 0; i < value.length(); i++) {
+    char c = value[i];
+    if (c == '&') {
+      out += F("&amp;");
+    } else if (c == '\'') {
+      out += F("&#39;");
+    } else if (c == '"') {
+      out += F("&quot;");
+    } else if (c == '<') {
+      out += F("&lt;");
+    } else if (c == '>') {
+      out += F("&gt;");
+    } else {
+      out += c;
+    }
+  }
+  return out;
+}
+
+static void appendWifiFields(String &html, int number, const String &ssid, const String &pass) {
+  char buffer[320];
+  snprintf(buffer, sizeof(buffer),
+           "<label for='wifi%d_ssid'>WiFi %d name</label><input id='wifi%d_ssid' name='wifi%d_ssid' maxlength='32' "
+           "autocomplete='off' value='",
+           number, number, number, number);
+  html += buffer;
+  html += htmlAttr(ssid);
+  snprintf(buffer, sizeof(buffer),
+           "'><label for='wifi%d_pass'>WiFi %d password</label><input id='wifi%d_pass' name='wifi%d_pass' "
+           "type='password' maxlength='64' autocomplete='new-password' placeholder='%s'>",
+           number, number, number, number, pass.length() ? "saved" : "not set");
+  html += buffer;
+}
+
+static void appendSelect(String &html, const char *name, const char *label, const uint8_t *options, size_t count,
+                         uint8_t selected, const char *suffix) {
+  html += F("<label for='");
+  html += name;
+  html += F("'>");
+  html += label;
+  html += F("</label><select id='");
+  html += name;
+  html += F("' name='");
+  html += name;
+  html += F("'>");
+  for (size_t i = 0; i < count; i++) {
+    html += F("<option value='");
+    html += options[i];
+    html += F("'");
+    html += options[i] == selected ? F(" selected") : F("");
+    html += F(">");
+    html += options[i];
+    html += suffix;
+    html += F("</option>");
+  }
+  html += F("</select>");
+}
+
+static void appendOnlineSection(String &html) {
+  static const uint8_t reportHours[] = {4, 5, 6, 7, 8, 9, 10, 11, 12};
+  static const uint8_t eveningHours[] = {16, 17, 18, 19, 20, 21, 22};
+  static const uint8_t batchOptions[] = {15, 30, 60};
+  static const uint8_t dayOptions[] = {1, 2, 3, 4, 5, 6, 7};
+  html += F("<h2>Online</h2>");
+  html += F("<p class='hint'>With a URL and a WiFi network set, ChargeScreen joins WiFi only to send drain alerts, a morning battery report, an evening solar report and a silent data batch. Use an ntfy topic such as https://ntfy.sh/your_topic, or your own endpoint. Nothing is sent in demo mode. Status: ");
+  html += onlineStatusLine();
+  html += F("</p>");
+  appendWifiFields(html, 1, onlineWifiSsid[0], onlineWifiPass[0]);
+  appendWifiFields(html, 2, onlineWifiSsid[1], onlineWifiPass[1]);
+  html += F("<label for='post_url'>Send to URL</label><input id='post_url' name='post_url' maxlength='191' autocomplete='off' placeholder='https://ntfy.sh/your_topic' value='");
+  html += htmlAttr(onlinePostUrl);
+  html += F("'><label for='tz_override'>Time zone override</label><input id='tz_override' name='tz_override' maxlength='63' autocomplete='off' placeholder='automatic, e.g. CET-1CEST,M3.5.0,M10.5.0/3' value='");
+  html += htmlAttr(onlineTzOverride);
+  html += F("'><div class='grid'><label for='dis_amps'>Drain limit (A)</label><label for='dis_win_min'>Drain window (min)</label>");
+  html += F("<input id='dis_amps' name='dis_amps' type='number' min='0.5' max='50' step='0.1' value='");
+  html += String(onlineSettings.disAmps, 1);
+  html += F("'><input id='dis_win_min' name='dis_win_min' type='number' min='15' max='120' step='1' value='");
+  html += onlineSettings.disWinMin;
+  html += F("'></div>");
+  appendSelect(html, "report_hour", "Morning report hour", reportHours, sizeof(reportHours), onlineSettings.reportHour, ":00");
+  appendSelect(html, "evening_hour", "Evening report hour", eveningHours, sizeof(eveningHours), onlineSettings.eveningHour, ":00");
+  appendSelect(html, "batch_min", "Batch interval", batchOptions, sizeof(batchOptions), onlineSettings.batchMin, " min");
+  appendSelect(html, "days_avg", "Days to average", dayOptions, sizeof(dayOptions), onlineSettings.daysAvg, "");
+}
+
 static String settingsStatusMessage(const String &code) {
   if (code == "saved") {
     return "Saved. Waiting for fresh BLE data.";
@@ -1922,6 +2062,12 @@ static String settingsStatusMessage(const String &code) {
   if (code == "capture-cancelled") {
     return "BLE capture cancelled. No CSV was saved.";
   }
+  if (code == "test-queued") {
+    return "Test message queued. It is sent once this hotspot turns off.";
+  }
+  if (code == "test-off") {
+    return "Online sending is off. Save a URL and a WiFi network, and turn off demo mode.";
+  }
   return "";
 }
 
@@ -1933,7 +2079,7 @@ static void redirectToSettingsPage(const char *statusCode) {
 
 static String settingsPageHtml(const String &message = "") {
   String html;
-  html.reserve(11000);
+  html.reserve(14000);
   html += F("<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>");
   html += F("<meta http-equiv='Cache-Control' content='no-store'>");
   html += F("<title>ChargeScreen Setup</title><style>");
@@ -1992,6 +2138,7 @@ static String settingsPageHtml(const String &message = "") {
   html += F(">Victron</option><option value='eco'");
   html += ecoWorthyBatteryMode ? F(" selected") : F("");
   html += F(">Eco-Worthy</option></select>");
+  appendOnlineSection(html);
   html += F("<h2>Settings</h2>");
   html += F("<label for='solar_watts'>Solar panel watts</label><input id='solar_watts' name='solar_watts' type='number' min='");
   html += MIN_SOLAR_ARRAY_WATTS;
@@ -2080,6 +2227,8 @@ static String settingsPageHtml(const String &message = "") {
   html += String(demoOrionInputCurrent, 1);
   html += F("'></div>");
   html += F("<button type='submit'>Save Settings</button></form>");
+  html += F("<form method='post' action='/online-test' data-working='Queueing test message...'>");
+  html += F("<button class='secondary' type='submit'>Send test message</button></form>");
   html += F("<form method='post' action='/clear-keys' data-working='Clearing keys...'>");
   html += F("<button class='danger' type='submit'>Clear Saved Keys</button></form>");
   html += F("<h2>Premade ChargeScreen</h2>");
@@ -2124,6 +2273,151 @@ static void handleSettingsRoot() {
   noteSettingsServerActivity();
   settingsServer.sendHeader("Cache-Control", "no-store");
   settingsServer.send(200, "text/html", settingsPageHtml(settingsStatusMessage(settingsServer.arg("status"))));
+}
+
+// Empty field: keep the current value. Returns false when out of range.
+static bool readIntArg(const char *name, int minValue, int maxValue, int &out) {
+  String text = settingsServer.arg(name);
+  text.trim();
+  if (!text.length()) {
+    return true;
+  }
+  int value = text.toInt();
+  if (value < minValue || value > maxValue) {
+    return false;
+  }
+  out = value;
+  return true;
+}
+
+static void putOrRemove(const char *key, const String &value) {
+  if (value.length()) {
+    secrets.putString(key, value);
+  } else {
+    secrets.remove(key);
+  }
+}
+
+// Returns false if any Online field was invalid; valid fields are still saved.
+static bool saveOnlineSettings() {
+  bool ok = true;
+  for (int n = 0; n < 2; n++) {
+    char ssidKey[12];
+    char passKey[12];
+    snprintf(ssidKey, sizeof(ssidKey), "wifi%d_ssid", n + 1);
+    snprintf(passKey, sizeof(passKey), "wifi%d_pass", n + 1);
+    String ssid = settingsServer.arg(ssidKey);
+    ssid.trim();
+    String pass = settingsServer.arg(passKey);
+    if (ssid.length() > 32 || pass.length() > 64) {
+      ok = false;
+      continue;
+    }
+    bool ssidChanged = ssid != onlineWifiSsid[n];
+    if (ssidChanged) {
+      onlineWifiSsid[n] = ssid;
+      putOrRemove(ssidKey, ssid);
+    }
+    if (pass.length()) {
+      onlineWifiPass[n] = pass;
+      secrets.putString(passKey, pass);
+    } else if (ssidChanged) {
+      // A new network name with a blank password means an open network.
+      onlineWifiPass[n] = "";
+      secrets.remove(passKey);
+    }
+  }
+
+  String url = settingsServer.arg("post_url");
+  url.trim();
+  char base[96];
+  char topic[64];
+  bool urlOk = url.length() == 0 ||
+               ((url.startsWith("https://") || url.startsWith("http://")) && url.length() <= 191 &&
+                (cs::sinkType(url.c_str()) != cs::SinkType::Ntfy ||
+                 cs::ntfyTarget(url.c_str(), base, sizeof(base), topic, sizeof(topic))));
+  if (!urlOk) {
+    ok = false;
+  } else if (url != onlinePostUrl) {
+    onlinePostUrl = url;
+    putOrRemove("post_url", url);
+  }
+
+  String tz = settingsServer.arg("tz_override");
+  tz.trim();
+  if (tz.length() > 63) {
+    ok = false;
+  } else if (tz != onlineTzOverride) {
+    onlineTzOverride = tz;
+    putOrRemove("tz_override", tz);
+  }
+
+  String ampsText = settingsServer.arg("dis_amps");
+  ampsText.trim();
+  if (ampsText.length()) {
+    float amps = ampsText.toFloat();
+    if (amps >= 0.5f && amps <= 50.0f) {
+      if (amps != onlineSettings.disAmps) {
+        onlineSettings.disAmps = amps;
+        secrets.putFloat("dis_amps", amps);
+      }
+    } else {
+      ok = false;
+    }
+  }
+
+  int value = onlineSettings.disWinMin;
+  if (readIntArg("dis_win_min", 15, 120, value)) {
+    if (value != onlineSettings.disWinMin) {
+      onlineSettings.disWinMin = static_cast<uint16_t>(value);
+      secrets.putUShort("dis_win_min", onlineSettings.disWinMin);
+    }
+  } else {
+    ok = false;
+  }
+
+  value = onlineSettings.reportHour;
+  if (readIntArg("report_hour", 4, 12, value)) {
+    if (value != onlineSettings.reportHour) {
+      onlineSettings.reportHour = static_cast<uint8_t>(value);
+      secrets.putUChar("report_hour", onlineSettings.reportHour);
+    }
+  } else {
+    ok = false;
+  }
+
+  value = onlineSettings.eveningHour;
+  if (readIntArg("evening_hour", 16, 22, value)) {
+    if (value != onlineSettings.eveningHour) {
+      onlineSettings.eveningHour = static_cast<uint8_t>(value);
+      secrets.putUChar("evening_hour", onlineSettings.eveningHour);
+    }
+  } else {
+    ok = false;
+  }
+
+  value = onlineSettings.batchMin;
+  if (readIntArg("batch_min", 15, 60, value) && cs::sanitiseBatchMin(value) == value) {
+    if (value != onlineSettings.batchMin) {
+      onlineSettings.batchMin = static_cast<uint8_t>(value);
+      secrets.putUChar("batch_min", onlineSettings.batchMin);
+    }
+  } else {
+    ok = false;
+  }
+
+  value = onlineSettings.daysAvg;
+  if (readIntArg("days_avg", 1, 7, value)) {
+    if (value != onlineSettings.daysAvg) {
+      onlineSettings.daysAvg = static_cast<uint8_t>(value);
+      secrets.putUChar("days_avg", onlineSettings.daysAvg);
+    }
+  } else {
+    ok = false;
+  }
+
+  applyOnlineConfig();
+  return ok;
 }
 
 static void handleSettingsSave() {
@@ -2298,6 +2592,10 @@ static void handleSettingsSave() {
     }
   }
 
+  if (!saveOnlineSettings()) {
+    invalid = true;
+  }
+
   demoBatterySoc = constrain(settingsServer.arg("demo_soc").toFloat(), 0.0f, 100.0f);
   demoBatteryVoltage = constrain(settingsServer.arg("demo_voltage").toFloat(), 0.0f, 80.0f);
   demoBatteryCurrent = constrain(settingsServer.arg("demo_current").toFloat(), -300.0f, 300.0f);
@@ -2366,6 +2664,15 @@ static void handleSettingsClearKeys() {
   drawCurrentPage(true);
 }
 
+static void handleOnlineTest() {
+  noteSettingsServerActivity();
+  if (!onlineEnabled() || demoModeEnabled || !telemetryQueueTest()) {
+    redirectToSettingsPage("test-off");
+    return;
+  }
+  redirectToSettingsPage("test-queued");
+}
+
 static void handleCaptureDownload() {
   noteSettingsServerActivity();
   if (!captureSaved || !LittleFS.exists(capturePath)) {
@@ -2423,12 +2730,17 @@ static void startSettingsServer() {
     return;
   }
 
+  settingsMessage = "Starting WiFi...";
+  drawCurrentPage(true);
+  netlinkPause();  // waits for any upload in progress to finish or abort
+
   WiFi.mode(WIFI_AP);
   bool started = strlen(SETTINGS_AP_PASSWORD) >= 8
                      ? WiFi.softAP(SETTINGS_AP_SSID, SETTINGS_AP_PASSWORD)
                      : WiFi.softAP(SETTINGS_AP_SSID);
 
   if (!started) {
+    netlinkResume();
     settingsMessage = "WiFi failed";
     drawCurrentPage(true);
     return;
@@ -2437,6 +2749,7 @@ static void startSettingsServer() {
   settingsServer.on("/", HTTP_GET, handleSettingsRoot);
   settingsServer.on("/save", HTTP_POST, handleSettingsSave);
   settingsServer.on("/clear-keys", HTTP_POST, handleSettingsClearKeys);
+  settingsServer.on("/online-test", HTTP_POST, handleOnlineTest);
   settingsServer.on("/download-capture", HTTP_GET, handleCaptureDownload);
   settingsServer.on("/capture-status", HTTP_GET, handleCaptureStatus);
   settingsServer.on("/capture-start", HTTP_POST, handleCaptureStart);
@@ -2460,6 +2773,7 @@ static void stopSettingsServer() {
   WiFi.softAPdisconnect(true);
   WiFi.mode(WIFI_OFF);
   settingsServerActive = false;
+  netlinkResume();
   settingsMessage = "WiFi off";
   invalidateScreens();
   drawCurrentPage(true);
@@ -2626,12 +2940,13 @@ static void drawSettingsInfoPage(bool force = false) {
     gfx->print(value.substring(0, 14));
   };
 
-  drawInfoLine(84, "WiFi", settingsServerActive ? "On" : "Off");
-  drawInfoLine(104, "Demo", demoModeEnabled ? "On" : "Off");
-  drawInfoLine(124, "Rotation", String(screenRotationDegrees));
-  drawInfoLine(144, "Battery", batteryModeText());
-  drawInfoLine(164, "Label/Grid", String(showValueLabels ? "On/" : "Off/") + (showValueGrid ? "On" : "Off"));
-  drawInfoLine(184, "Keys", storedVictronKey.length() || storedSolarKey.length() || storedOrionKey.length() ? "saved" : "-");
+  drawInfoLine(78, "WiFi", settingsServerActive ? "On" : "Off");
+  drawInfoLine(96, "Demo", demoModeEnabled ? "On" : "Off");
+  drawInfoLine(114, "Rotation", String(screenRotationDegrees));
+  drawInfoLine(132, "Battery", batteryModeText());
+  drawInfoLine(150, "Label/Grid", String(showValueLabels ? "On/" : "Off/") + (showValueGrid ? "On" : "Off"));
+  drawInfoLine(168, "Keys", storedVictronKey.length() || storedSolarKey.length() || storedOrionKey.length() ? "saved" : "-");
+  drawInfoLine(186, "Online", onlineStatusLine());
 
   drawBackButton();
   settingsPageDrawn = true;
@@ -3603,6 +3918,31 @@ static void updateTouchSwipe() {
   }
 }
 
+// The same struct copies the dashboard makes (displayStats() and friends),
+// with the same 10 s freshness rule as the "Signal lost" status.
+static cs::Sample telemetrySample() {
+  cs::Sample sample;
+  BatteryStats battery = displayStats();
+  if (battery.valid && !ecoWorthyBatteryMode && static_cast<int32_t>(millis() - lastVictronDecodeMs) <= 10000) {
+    sample.shuntValid = true;
+    sample.currentA = battery.current;
+    sample.soc = battery.soc;
+    sample.consumedAh = isnan(battery.consumedAh) ? NAN : fabsf(battery.consumedAh);
+  }
+  SolarStats solar = displaySolarStats();
+  if (storedSolarKey.length() && solar.valid && static_cast<int32_t>(millis() - lastSolarDecodeMs) <= 10000) {
+    sample.solarValid = true;
+    sample.solarBatA = solar.batteryCurrent;
+    sample.pvW = solar.pvPower;
+  }
+  OrionStats orion = displayOrionStats();
+  if (storedOrionKey.length() && orion.valid && static_cast<int32_t>(millis() - lastOrionDecodeMs) <= 10000) {
+    sample.orionValid = true;
+    sample.orionOutA = orion.outputCurrent;
+  }
+  return sample;
+}
+
 static void updateAutoCycle() {
   if (!screenAwake || cycleSeconds == 0 || captureActive || captureReadyScreenActive ||
       settingsPageActive || settingsRotationPageActive || settingsInfoPageActive) {
@@ -3635,6 +3975,9 @@ void setup() {
   if (!LittleFS.begin(true)) {
     Serial.println("LittleFS init failed");
   }
+  telemetryBegin(secrets);
+  applyOnlineConfig();
+  netlinkBegin();
   drawCurrentPage(true);
 
   NimBLEDevice::init("round-battery-dashboard");
@@ -3662,6 +4005,10 @@ void loop() {
   updateTouchSwipe();
   updateAutoCycle();
   updateScreenTimeout();
+  netlinkSetSuppressed(demoModeEnabled);
+  if (telemetrySampleDue(millis())) {
+    telemetryLoop(telemetrySample(), demoModeEnabled, storedSolarKey.length() > 0, storedOrionKey.length() > 0);
+  }
 
   if (captureActive && millis() - captureStartMs >= CAPTURE_DURATION_MS) {
     stopCapture("timer");
