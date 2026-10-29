@@ -617,12 +617,15 @@ inline size_t buildClearBody(char *out, size_t cap, float avgA, float soc) {
 }
 
 inline bool shownAh(float v) {
-  return std::isfinite(v) && std::fabs(v) >= 0.05f;
+  return std::isfinite(v) && v >= 0.5f;  // printed with %.0f, so show only when it reads as 1 Ah or more
 }
 
 // yesterday may be null (no complete record of yesterday).
 inline size_t buildMorningBody(char *out, size_t cap, float soc, float remaining, const DaysEstimate &est,
                                const DayStats *yesterday, bool hasSolarKey, bool hasOrionKey) {
+  if (!socKnown(soc)) {
+    return 0;
+  }
   TextWriter w(out, cap);
   w.putf("%.0f%%", soc);
   if (std::isfinite(remaining)) {
@@ -703,7 +706,7 @@ inline size_t formatDelayedSuffix(char *out, size_t cap, uint32_t nowUnix, uint3
   if (haveClock && offsetKnown) {
     char hm[6];
     formatHhMm(localMinuteOfDay(eventUnix, offsetS), hm);
-    w.putf(" (delayed, happened %s)", hm);
+    w.putf(" (delayed, happened at %s)", hm);
   } else {
     w.putf(" (delayed, happened %lu min ago)", static_cast<unsigned long>(elapsed / 60U));
   }

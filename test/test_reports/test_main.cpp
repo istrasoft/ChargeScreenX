@@ -95,6 +95,24 @@ static void test_morning_omissions() {
   TEST_ASSERT_EQUAL_STRING("78% (196 Ah left)", body);
 }
 
+static void test_morning_soc_guard() {
+  char body[cs::MSG_BODY_LEN];
+  cs::DaysEstimate none;
+  TEST_ASSERT_EQUAL_UINT32(0, cs::buildMorningBody(body, sizeof body, 102.3f, 196.0f, none, nullptr, true, true));
+  TEST_ASSERT_EQUAL_UINT32(0, cs::buildMorningBody(body, sizeof body, NAN, 196.0f, none, nullptr, true, true));
+}
+
+static void test_morning_sub_one_ah_parts() {
+  char body[cs::MSG_BODY_LEN];
+  cs::DaysEstimate none;
+  cs::DayStats y = yesterdayStats(52.0f, 0.3f, -3.0f);
+  cs::buildMorningBody(body, sizeof body, 78.0f, NAN, none, &y, true, true);
+  TEST_ASSERT_EQUAL_STRING("78%\nYesterday: used 52 Ah.", body);
+  y = yesterdayStats(52.0f, 0.6f, 0.49f);
+  cs::buildMorningBody(body, sizeof body, 78.0f, NAN, none, &y, true, true);
+  TEST_ASSERT_EQUAL_STRING("78%\nYesterday: used 52 Ah, solar +1 Ah.", body);
+}
+
 static void test_morning_day_counts_and_limits() {
   char body[cs::MSG_BODY_LEN];
   cs::buildMorningBody(body, sizeof body, 78.0f, 196.0f, estimate(2, true, true, NAN, 2.1f), nullptr, true, true);
@@ -128,7 +146,7 @@ static void test_delayed_suffix_forms() {
   TEST_ASSERT_EQUAL_UINT32(0, cs::formatDelayedSuffix(s, sizeof s, event + 600, event, true, 3600, true, 0, 0));
   TEST_ASSERT_EQUAL_STRING("", s);
   cs::formatDelayedSuffix(s, sizeof s, event + 601, event, true, 3600, true, 0, 0);
-  TEST_ASSERT_EQUAL_STRING(" (delayed, happened 23:53)", s);
+  TEST_ASSERT_EQUAL_STRING(" (delayed, happened at 23:53)", s);
   // Clock known but no local offset yet: minutes ago.
   cs::formatDelayedSuffix(s, sizeof s, event + 1500, event, false, 0, true, 0, 0);
   TEST_ASSERT_EQUAL_STRING(" (delayed, happened 25 min ago)", s);
@@ -188,6 +206,8 @@ int main(int, char **) {
   RUN_TEST(test_alert_and_clear_text);
   RUN_TEST(test_morning_full_example);
   RUN_TEST(test_morning_omissions);
+  RUN_TEST(test_morning_soc_guard);
+  RUN_TEST(test_morning_sub_one_ah_parts);
   RUN_TEST(test_morning_day_counts_and_limits);
   RUN_TEST(test_evening_example);
   RUN_TEST(test_delayed_suffix_forms);
