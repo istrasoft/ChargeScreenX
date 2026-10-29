@@ -33,6 +33,19 @@ Keys entered there are stored in the ESP32 flash preferences area. No Victron ke
 
 Each Victron device kind locks to the first address that decodes correctly three times in a row, so nearby vans or boats with Victron gear are ignored. The lock is released if the device is not heard for 10 minutes or its key is changed. The setup page shows the locked address.
 
+## Online reports
+
+ChargeScreen can join WiFi only when it has something to send, and push to an HTTP endpoint:
+
+- a high-drain alert when the battery discharges faster than a limit over a rolling window (default 4.0 A over 45 minutes), and an all-clear when it is back to normal;
+- a morning battery report (default 10:00) with an estimate of the days remaining;
+- an evening solar report (default 20:00, after production ends, 23:00 at the latest);
+- a silent data batch of 5-minute records (default every 30 minutes).
+
+Set it up in the **Online** section of the setup page: up to two WiFi networks, the URL, and optionally a POSIX time zone such as `CET-1CEST,M3.5.0,M10.5.0/3` (otherwise the time zone is looked up from the IP address once a day). Use an ntfy topic URL such as `https://ntfy.sh/your_topic` and subscribe to it in the ntfy app, or your own endpoint, which receives JSON (`{"v":1,"kind":...,"title":...,"message":...,"priority":...,"time":...,"data":{...}}`). **Send test message** checks the setup once the hotspot turns off. The info screen shows `Online: Off`, `Waiting`, `No WiFi`, `Sent HH:MM` or `Error HH:MM`.
+
+While offline, up to 24 hours of records and 16 alerts or reports are kept on the device and sent later; late messages say when they happened. Battery capacity is learned from the shunt, so the remaining Ah and days estimates appear after a while. Nothing is sent in demo mode, and TLS certificates are not checked, so don't use it with an endpoint that needs a password.
+
 ## Flashing
 
 This fork is flashed over USB only (`pio run -t upload`); there is no web firmware update. It uses a single 3 MB app partition. Unit tests for the device-independent logic run with `pio test -e native`.
