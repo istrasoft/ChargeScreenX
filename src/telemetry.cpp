@@ -75,6 +75,9 @@ bool readAt(const char *path, size_t offset, void *data, size_t len) {
 }
 
 size_t fileSize(const char *path) {
+  if (!LittleFS.exists(path)) {
+    return 0;
+  }
   File f = LittleFS.open(path, "r");
   if (!f) {
     return 0;
@@ -109,7 +112,8 @@ bool openCache() {
   const size_t size = sizeof(CacheHeader) + sizeof(cs::Record) * cs::RECORD_RING_SIZE;
   CacheHeader h;
   bool ok = fileSize(CACHE_PATH) == size && readAt(CACHE_PATH, 0, &h, sizeof(h)) && h.version == STORE_VERSION &&
-            h.recordSize == sizeof(cs::Record) && h.capacity == cs::RECORD_RING_SIZE;
+            h.recordSize == sizeof(cs::Record) && h.capacity == cs::RECORD_RING_SIZE &&
+            h.ring.sentSeq <= h.ring.nextSeq;
   if (!ok) {
     Serial.println("Online: new record cache");
     if (!createZeroFile(CACHE_PATH, size)) {
@@ -132,7 +136,8 @@ bool openOutbox() {
   const size_t size = sizeof(OutboxHeader) + sizeof(cs::Message) * cs::OUTBOX_SIZE;
   OutboxHeader h;
   bool ok = fileSize(OUTBOX_PATH) == size && readAt(OUTBOX_PATH, 0, &h, sizeof(h)) && h.version == STORE_VERSION &&
-            h.messageSize == sizeof(cs::Message) && h.capacity == cs::OUTBOX_SIZE;
+            h.messageSize == sizeof(cs::Message) && h.capacity == cs::OUTBOX_SIZE &&
+            h.queue.nextSeq - h.queue.headSeq <= cs::OUTBOX_SIZE && h.queue.nextId != 0;
   if (!ok) {
     Serial.println("Online: new outbox");
     if (!createZeroFile(OUTBOX_PATH, size)) {
@@ -156,6 +161,10 @@ bool storeBegin() {
   if (!storeMutex) {
     storeMutex = xSemaphoreCreateMutex();
   }
+  if (!storeMutex) {
+    Serial.println("Online: store mutex failed");
+    return false;
+  }
   StoreLock lock;
   storeReady = openCache() && openOutbox();
   Serial.printf("Online: store %s, boot %u, %lu unsent records, %u messages\n",
@@ -175,9 +184,13 @@ bool storeAppendRecord(const cs::Record &rec) {
     return false;
   }
   StoreLock lock;
+  const cs::RingIndex before = cacheHeader.ring;
   uint32_t seq = cs::ringPush(cacheHeader.ring);
-  bool ok = writeAt(CACHE_PATH, cacheOffset(seq), &rec, sizeof(rec));
-  return writeAt(CACHE_PATH, 0, &cacheHeader, sizeof(cacheHeader)) && ok;
+  if (!writeAt(CACHE_PATH, cacheOffset(seq), &rec, sizeof(rec))) {
+    cacheHeader.ring = before;
+    return false;
+  }
+  return writeAt(CACHE_PATH, 0, &cacheHeader, sizeof(cacheHeader));
 }
 
 bool storeEnqueueMessage(const cs::Message &msg) {
@@ -187,12 +200,16 @@ bool storeEnqueueMessage(const cs::Message &msg) {
   StoreLock lock;
   uint32_t id = 0;
   bool dropped = false;
+  const cs::QueueIndex before = outboxHeader.queue;
   uint8_t slot = cs::queuePush(outboxHeader.queue, static_cast<cs::MsgKind>(msg.kind), id, dropped);
   if (dropped) {
     Serial.println("Online: outbox full, dropped the oldest message");
   }
-  bool ok = writeAt(OUTBOX_PATH, outboxOffset(slot), &msg, sizeof(msg));
-  return writeAt(OUTBOX_PATH, 0, &outboxHeader, sizeof(outboxHeader)) && ok;
+  if (!writeAt(OUTBOX_PATH, outboxOffset(slot), &msg, sizeof(msg))) {
+    outboxHeader.queue = before;
+    return false;
+  }
+  return writeAt(OUTBOX_PATH, 0, &outboxHeader, sizeof(outboxHeader));
 }
 
 bool storePeekMessage(cs::Message &msg, uint32_t &id) {
@@ -257,7 +274,9 @@ void storeMarkRecordsSent(uint32_t endSeq) {
   uint32_t before = cacheHeader.ring.sentSeq;
   cs::ringMarkSentThrough(cacheHeader.ring, endSeq);
   if (cacheHeader.ring.sentSeq != before) {
-    writeAt(CACHE_PATH, 0, &cacheHeader, sizeof(cacheHeader));
+    if (!writeAt(CACHE_PATH, 0, &cacheHeader, sizeof(cacheHeader))) {
+      Serial.println("store: mark records sent failed");
+    }
   }
 }
 
@@ -276,8 +295,10 @@ void storeFillTimes(uint32_t nowUnix, uint32_t nowMs) {
         break;
       }
       if (cs::recordFillTime(rec, cacheHeader.boot, nowUnix, nowMs)) {
-        cache.seek(offset);
-        cache.write(reinterpret_cast<const uint8_t *>(&rec), sizeof(rec));
+        if (!cache.seek(offset) || cache.write(reinterpret_cast<const uint8_t *>(&rec), sizeof(rec)) != sizeof(rec)) {
+          Serial.println("store: fill record time failed");
+          break;
+        }
       }
     }
     cache.close();
@@ -291,8 +312,10 @@ void storeFillTimes(uint32_t nowUnix, uint32_t nowMs) {
         break;
       }
       if (cs::messageFillTime(msg, cacheHeader.boot, nowUnix, nowMs)) {
-        outbox.seek(offset);
-        outbox.write(reinterpret_cast<const uint8_t *>(&msg), sizeof(msg));
+        if (!outbox.seek(offset) || outbox.write(reinterpret_cast<const uint8_t *>(&msg), sizeof(msg)) != sizeof(msg)) {
+          Serial.println("store: fill message time failed");
+          break;
+        }
       }
     }
     outbox.close();
@@ -321,6 +344,9 @@ bool storeLoadDays(cs::DayHistory &days) {
   }
   StoreLock lock;
   DaysHeader h;
+  if (!LittleFS.exists(DAYS_PATH)) {
+    return false;
+  }
   if (fileSize(DAYS_PATH) != sizeof(DaysHeader) + sizeof(cs::DayHistory) || !readAt(DAYS_PATH, 0, &h, sizeof(h)) ||
       h.version != STORE_VERSION || h.size != sizeof(cs::DayHistory)) {
     LittleFS.remove(DAYS_PATH);
