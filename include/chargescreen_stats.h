@@ -760,4 +760,242 @@ inline void onlineStatusText(OnlineState state, int16_t localMinute, char *out, 
   }
 }
 
+// ---------------------------------------------------------------- records
+
+constexpr size_t BATCH_JSON_MAX = 2048;
+constexpr size_t ENVELOPE_MAX = 4608;
+
+// One 5-minute record, stored as-is in /tx_cache.bin. NAN = no valid data.
+struct Record {
+  uint32_t t = 0;        // start, unix seconds; 0 until the clock is known
+  uint32_t startMs = 0;  // millis() at the start, meaningful while boot matches
+  uint16_t boot = 0;
+  uint16_t reserved = 0;
+  float soc = NAN;
+  float used = NAN;
+  float i = NAN;
+  float imin = NAN;
+  float imax = NAN;
+  float pv = NAN;
+  float pvmax = NAN;
+  float orion = NAN;
+};
+static_assert(sizeof(Record) == 44, "Record layout is stored on flash");
+
+struct RecordBuilder {
+  Record rec;
+  uint16_t shuntCount = 0;
+  uint16_t pvCount = 0;
+  uint16_t orionCount = 0;
+  float currentSum = 0.0f;
+  float pvSum = 0.0f;
+  float orionSum = 0.0f;
+};
+
+inline void recordStart(RecordBuilder &b, uint32_t unixOr0, uint32_t nowMs, uint16_t boot) {
+  b = RecordBuilder();
+  b.rec.t = clockValid(unixOr0) ? unixOr0 : 0;
+  b.rec.startMs = nowMs;
+  b.rec.boot = boot;
+}
+
+inline void recordAdd(RecordBuilder &b, const Sample &s) {
+  if (s.shuntValid && !std::isnan(s.currentA)) {
+    if (b.shuntCount == 0 || s.currentA < b.rec.imin) {
+      b.rec.imin = s.currentA;
+    }
+    if (b.shuntCount == 0 || s.currentA > b.rec.imax) {
+      b.rec.imax = s.currentA;
+    }
+    b.currentSum += s.currentA;
+    b.shuntCount++;
+    if (socKnown(s.soc)) {
+      b.rec.soc = s.soc;
+    }
+    if (std::isfinite(s.consumedAh)) {
+      b.rec.used = s.consumedAh;
+    }
+  }
+  if (s.solarValid && std::isfinite(s.pvW)) {
+    if (b.pvCount == 0 || s.pvW > b.rec.pvmax) {
+      b.rec.pvmax = s.pvW;
+    }
+    b.pvSum += s.pvW;
+    b.pvCount++;
+  }
+  if (s.orionValid && std::isfinite(s.orionOutA)) {
+    b.orionSum += s.orionOutA;
+    b.orionCount++;
+  }
+}
+
+inline Record recordClose(const RecordBuilder &b) {
+  Record r = b.rec;
+  r.i = b.shuntCount ? b.currentSum / b.shuntCount : NAN;
+  r.pv = b.pvCount ? b.pvSum / b.pvCount : NAN;
+  r.orion = b.orionCount ? b.orionSum / b.orionCount : NAN;
+  return r;
+}
+
+inline float roundTo(float v, float scale) {
+  float r = std::round(v * scale) / scale;
+  return r == 0.0f ? 0.0f : r;  // no "-0.0"
+}
+
+inline void putField1(TextWriter &w, const char *key, float v) {
+  if (std::isfinite(v)) {
+    w.putf(",\"%s\":%.1f", key, static_cast<double>(roundTo(v, 10.0f)));
+  }
+}
+
+inline void putField0(TextWriter &w, const char *key, float v) {
+  if (std::isfinite(v)) {
+    w.putf(",\"%s\":%.0f", key, static_cast<double>(roundTo(v, 1.0f)));
+  }
+}
+
+inline size_t buildBatchJson(char *out, size_t cap, const Record *recs, uint8_t count) {
+  TextWriter w(out, cap);
+  w.putStr("{\"v\":1,\"recs\":[");
+  for (uint8_t k = 0; k < count; k++) {
+    const Record &r = recs[k];
+    w.putf("%s{\"t\":%lu", k ? "," : "", static_cast<unsigned long>(r.t));
+    putField1(w, "soc", r.soc);
+    putField1(w, "used", r.used);
+    putField1(w, "i", r.i);
+    putField1(w, "imin", r.imin);
+    putField1(w, "imax", r.imax);
+    putField0(w, "pv", r.pv);
+    putField0(w, "pvmax", r.pvmax);
+    putField1(w, "or", r.orion);
+    w.putChar('}');
+  }
+  w.putStr("]}");
+  return w.result();
+}
+
+// ---------------------------------------------------------------- sinks
+
+enum class SinkType : uint8_t { Ntfy, Generic };
+
+// Lower-case host of an http(s) URL, without user info or port.
+inline bool urlHost(const char *url, char *host, size_t cap) {
+  const char *start = strstr(url, "://");
+  if (!start || cap == 0) {
+    return false;
+  }
+  start += 3;
+  const char *end = start;
+  while (*end && *end != '/' && *end != '?' && *end != '#') {
+    end++;
+  }
+  for (const char *p = start; p < end; ++p) {
+    if (*p == '@') {
+      start = p + 1;
+    }
+  }
+  const char *colon = start;
+  while (colon < end && *colon != ':') {
+    colon++;
+  }
+  size_t len = static_cast<size_t>(colon - start);
+  if (len == 0 || len >= cap) {
+    return false;
+  }
+  for (size_t i = 0; i < len; i++) {
+    char c = start[i];
+    host[i] = (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+  }
+  host[len] = '\0';
+  return true;
+}
+
+inline SinkType sinkType(const char *url) {
+  char host[96];
+  if (!urlHost(url, host, sizeof host)) {
+    return SinkType::Generic;
+  }
+  size_t len = strlen(host);
+  const char *suffix = ".ntfy.sh";
+  size_t suffixLen = strlen(suffix);
+  if (strcmp(host, "ntfy.sh") == 0 || (len > suffixLen && strcmp(host + len - suffixLen, suffix) == 0)) {
+    return SinkType::Ntfy;
+  }
+  return SinkType::Generic;
+}
+
+// base = scheme://host[:port]/ and topic = path without the leading '/'.
+inline bool ntfyTarget(const char *url, char *base, size_t baseCap, char *topic, size_t topicCap) {
+  const char *scheme = strstr(url, "://");
+  if (!scheme) {
+    return false;
+  }
+  const char *authority = scheme + 3;
+  const char *path = authority;
+  while (*path && *path != '/' && *path != '?' && *path != '#') {
+    path++;
+  }
+  size_t baseLen = static_cast<size_t>(path - url);
+  if (path == authority || baseLen + 2 > baseCap) {
+    return false;
+  }
+  memcpy(base, url, baseLen);
+  base[baseLen] = '/';
+  base[baseLen + 1] = '\0';
+  if (*path != '/') {
+    return false;
+  }
+  const char *t = path + 1;
+  const char *tEnd = t;
+  while (*tEnd && *tEnd != '?' && *tEnd != '#') {
+    tEnd++;
+  }
+  while (tEnd > t && tEnd[-1] == '/') {
+    tEnd--;
+  }
+  size_t topicLen = static_cast<size_t>(tEnd - t);
+  if (topicLen == 0 || topicLen >= topicCap || memchr(t, '/', topicLen)) {
+    return false;
+  }
+  memcpy(topic, t, topicLen);
+  topic[topicLen] = '\0';
+  return true;
+}
+
+// {"topic":..,"title":..,"message":..,"priority":N[,"tags":[tag]]}
+inline size_t buildNtfyEnvelope(char *out, size_t cap, const char *topic, const char *title, const char *message,
+                                uint8_t priority, const char *tag) {
+  TextWriter w(out, cap);
+  w.putStr("{\"topic\":\"");
+  w.putEscaped(topic);
+  w.putStr("\",\"title\":\"");
+  w.putEscaped(title);
+  w.putStr("\",\"message\":\"");
+  w.putEscaped(message);
+  w.putf("\",\"priority\":%u", static_cast<unsigned>(priority));
+  if (tag && tag[0]) {
+    w.putStr(",\"tags\":[\"");
+    w.putEscaped(tag);
+    w.putStr("\"]");
+  }
+  w.putChar('}');
+  return w.result();
+}
+
+// {"v":1,"kind":..,"title":..,"message":..,"priority":N,"time":unix,"data":{..}}
+// dataJson is a JSON object, or null for {}.
+inline size_t buildGenericEnvelope(char *out, size_t cap, MsgKind kind, const char *title, const char *message,
+                                   uint8_t priority, uint32_t unixTime, const char *dataJson) {
+  TextWriter w(out, cap);
+  w.putf("{\"v\":1,\"kind\":\"%s\",\"title\":\"", kindName(kind));
+  w.putEscaped(title);
+  w.putStr("\",\"message\":\"");
+  w.putEscaped(message);
+  w.putf("\",\"priority\":%u,\"time\":%lu,\"data\":", static_cast<unsigned>(priority),
+         static_cast<unsigned long>(unixTime));
+  w.putStr(dataJson ? dataJson : "{}");
+  w.putChar('}');
+  return w.result();
+}
+
 }  // namespace cs
