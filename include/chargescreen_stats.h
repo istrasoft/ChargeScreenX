@@ -998,4 +998,278 @@ inline size_t buildGenericEnvelope(char *out, size_t cap, MsgKind kind, const ch
   return w.result();
 }
 
+// ---------------------------------------------------------------- record cache ring
+
+// Sequence numbers never wrap in practice. Record seq lives in slot seq % cap.
+struct RingIndex {
+  uint32_t nextSeq = 0;  // seq of the next record to write
+  uint32_t sentSeq = 0;  // every seq below this has been sent
+};
+
+inline uint32_t ringOldestSeq(const RingIndex &r, uint16_t cap) {
+  return r.nextSeq > cap ? r.nextSeq - cap : 0;
+}
+
+inline uint32_t ringFirstUnsentSeq(const RingIndex &r, uint16_t cap) {
+  uint32_t oldest = ringOldestSeq(r, cap);
+  return r.sentSeq > oldest ? r.sentSeq : oldest;
+}
+
+inline uint32_t ringUnsentCount(const RingIndex &r, uint16_t cap) {
+  return r.nextSeq - ringFirstUnsentSeq(r, cap);
+}
+
+inline uint16_t ringSlot(uint32_t seq, uint16_t cap) {
+  return static_cast<uint16_t>(seq % cap);
+}
+
+// Returns the seq to write; the oldest record is overwritten when full.
+inline uint32_t ringPush(RingIndex &r) {
+  return r.nextSeq++;
+}
+
+inline void ringMarkSentThrough(RingIndex &r, uint32_t endSeq) {
+  if (endSeq > r.nextSeq) {
+    endSeq = r.nextSeq;
+  }
+  if (endSeq > r.sentSeq) {
+    r.sentSeq = endSeq;
+  }
+}
+
+enum class RecordAction : uint8_t { Include, Wait, Skip };
+
+// Records without a clock time wait for the first sync in their own boot;
+// those left over from an earlier boot can never be dated and are skipped.
+inline RecordAction recordSendAction(const Record &r, uint16_t currentBoot) {
+  if (r.t != 0) {
+    return RecordAction::Include;
+  }
+  return r.boot == currentBoot ? RecordAction::Wait : RecordAction::Skip;
+}
+
+inline bool recordFillTime(Record &r, uint16_t currentBoot, uint32_t nowUnix, uint32_t nowMs) {
+  if (r.t != 0 || r.boot != currentBoot || !clockValid(nowUnix)) {
+    return false;
+  }
+  r.t = nowUnix - static_cast<uint32_t>(nowMs - r.startMs) / 1000U;
+  return true;
+}
+
+inline bool messageFillTime(Message &m, uint16_t currentBoot, uint32_t nowUnix, uint32_t nowMs) {
+  if (m.eventUnix != 0 || m.boot != currentBoot || !clockValid(nowUnix)) {
+    return false;
+  }
+  m.eventUnix = nowUnix - static_cast<uint32_t>(nowMs - m.eventMs) / 1000U;
+  return true;
+}
+
+// ---------------------------------------------------------------- outbox queue
+
+struct QueueIndex {
+  uint32_t headSeq = 0;  // oldest pending message
+  uint32_t nextSeq = 0;
+  uint32_t nextId = 1;
+  uint32_t ids[OUTBOX_SIZE] = {};
+  uint8_t kinds[OUTBOX_SIZE] = {};
+};
+
+inline uint8_t queueCount(const QueueIndex &q) {
+  return static_cast<uint8_t>(q.nextSeq - q.headSeq);
+}
+
+inline int16_t queueOldestSlot(const QueueIndex &q) {
+  return queueCount(q) ? static_cast<int16_t>(q.headSeq % OUTBOX_SIZE) : -1;
+}
+
+inline int16_t queueFindKind(const QueueIndex &q, MsgKind kind) {
+  for (uint32_t seq = q.headSeq; seq != q.nextSeq; seq++) {
+    uint8_t slot = static_cast<uint8_t>(seq % OUTBOX_SIZE);
+    if (q.kinds[slot] == static_cast<uint8_t>(kind)) {
+      return slot;
+    }
+  }
+  return -1;
+}
+
+// Returns the slot to write the message into. A pending morning report is
+// replaced in place by a new one; otherwise the message is appended and the
+// oldest is dropped when the queue is full.
+inline uint8_t queuePush(QueueIndex &q, MsgKind kind, uint32_t &id, bool &dropped) {
+  dropped = false;
+  id = q.nextId++;
+  if (q.nextId == 0) {
+    q.nextId = 1;
+  }
+  if (kind == MsgKind::Morning) {
+    int16_t pending = queueFindKind(q, kind);
+    if (pending >= 0) {
+      q.ids[pending] = id;
+      return static_cast<uint8_t>(pending);
+    }
+  }
+  if (queueCount(q) >= OUTBOX_SIZE) {
+    q.headSeq++;
+    dropped = true;
+  }
+  uint8_t slot = static_cast<uint8_t>(q.nextSeq % OUTBOX_SIZE);
+  q.nextSeq++;
+  q.ids[slot] = id;
+  q.kinds[slot] = static_cast<uint8_t>(kind);
+  return slot;
+}
+
+// Removes the oldest message only if it is still the one that was sent.
+inline bool queuePopIfId(QueueIndex &q, uint32_t id) {
+  int16_t slot = queueOldestSlot(q);
+  if (slot < 0 || q.ids[slot] != id) {
+    return false;
+  }
+  q.headSeq++;
+  return true;
+}
+
+// ---------------------------------------------------------------- network results
+
+enum class NetResult : uint8_t { Sent, Drop, Fail, RateLimited };
+
+// code <= 0 is a network or TLS error from HTTPClient.
+inline NetResult classifyHttp(int code) {
+  if (code >= 200 && code < 300) {
+    return NetResult::Sent;
+  }
+  if (code == 429) {
+    return NetResult::RateLimited;
+  }
+  if (code >= 400 && code < 500) {
+    return NetResult::Drop;
+  }
+  return NetResult::Fail;
+}
+
+constexpr uint8_t BACKOFF_MAX_FAILURES = 5;
+
+// 1, 2, 5, 10, then 30 minutes. A 429 sets failures to BACKOFF_MAX_FAILURES.
+inline uint32_t backoffSeconds(uint8_t failures) {
+  constexpr uint16_t steps[BACKOFF_MAX_FAILURES] = {60, 120, 300, 600, 1800};
+  if (failures == 0) {
+    return 0;
+  }
+  return steps[(failures > BACKOFF_MAX_FAILURES ? BACKOFF_MAX_FAILURES : failures) - 1];
+}
+
+// ---------------------------------------------------------------- time zone lookup
+
+constexpr const char *IP_LOOKUP_URL = "https://api.ipify.org";
+constexpr const char *TIMEAPI_URL_PREFIX = "https://timeapi.io/api/TimeZone/ip?ipAddress=";
+constexpr const char *IPAPI_URL = "http://ip-api.com/json/?fields=status,message,offset";
+constexpr int32_t MAX_UTC_OFFSET_S = 14 * 3600;
+
+inline bool jsonSpace(char c) {
+  return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+// Minimal key finder: returns a pointer to the value after "key": (spaces
+// skipped), searching from json, or nullptr.
+inline const char *jsonValueAfterKey(const char *json, const char *key) {
+  size_t keyLen = strlen(key);
+  for (const char *p = strchr(json, '"'); p; p = strchr(p + 1, '"')) {
+    if (strncmp(p + 1, key, keyLen) != 0 || p[1 + keyLen] != '"') {
+      continue;
+    }
+    const char *q = p + 2 + keyLen;
+    while (jsonSpace(*q)) {
+      q++;
+    }
+    if (*q != ':') {
+      continue;
+    }
+    q++;
+    while (jsonSpace(*q)) {
+      q++;
+    }
+    return q;
+  }
+  return nullptr;
+}
+
+inline bool jsonReadOffset(const char *p, int32_t &out) {
+  if (!p) {
+    return false;
+  }
+  char *end = nullptr;
+  long value = strtol(p, &end, 10);
+  if (end == p || value < -MAX_UTC_OFFSET_S || value > MAX_UTC_OFFSET_S) {
+    return false;
+  }
+  out = static_cast<int32_t>(value);
+  return true;
+}
+
+// timeapi.io /api/TimeZone/ip?ipAddress=..: currentUtcOffset.seconds
+// (includes daylight saving).
+inline bool parseTimeapiOffset(const char *json, int32_t &offsetS) {
+  const char *current = jsonValueAfterKey(json, "currentUtcOffset");
+  if (!current || *current != '{') {
+    return false;
+  }
+  return jsonReadOffset(jsonValueAfterKey(current, "seconds"), offsetS);
+}
+
+// ip-api.com /json/?fields=status,message,offset: offset (includes daylight
+// saving) when status is "success".
+inline bool parseIpApiOffset(const char *json, int32_t &offsetS) {
+  const char *status = jsonValueAfterKey(json, "status");
+  if (!status || strncmp(status, "\"success\"", 9) != 0) {
+    return false;
+  }
+  return jsonReadOffset(jsonValueAfterKey(json, "offset"), offsetS);
+}
+
+// api.ipify.org returns the public IP as plain text.
+inline bool parsePlainIp(const char *body, char *out, size_t cap) {
+  while (jsonSpace(*body)) {
+    body++;
+  }
+  size_t len = 0;
+  bool separator = false;
+  for (; *body && !jsonSpace(*body); ++body) {
+    char c = *body;
+    bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+    if (!hex && c != '.' && c != ':') {
+      return false;
+    }
+    separator = separator || c == '.' || c == ':';
+    if (len + 1 >= cap) {
+      return false;
+    }
+    out[len++] = c;
+  }
+  while (jsonSpace(*body)) {
+    body++;
+  }
+  out[len] = '\0';
+  return *body == '\0' && separator && len >= 3;
+}
+
+inline bool buildTimeapiUrl(const char *ip, char *out, size_t cap) {
+  TextWriter w(out, cap);
+  w.putStr(TIMEAPI_URL_PREFIX);
+  w.putStr(ip);
+  return w.result() > 0;
+}
+
+// Offset of local time from UTC, from the struct tm fields of both
+// (tm_year, tm_yday, seconds of day). Used with a POSIX TZ override.
+inline int32_t tmOffsetSeconds(int localYear, int localYday, int32_t localSecOfDay, int utcYear, int utcYday,
+                               int32_t utcSecOfDay) {
+  int dayDiff;
+  if (localYear != utcYear) {
+    dayDiff = localYear > utcYear ? 1 : -1;
+  } else {
+    dayDiff = localYday - utcYday;
+  }
+  return dayDiff * 86400 + localSecOfDay - utcSecOfDay;
+}
+
 }  // namespace cs
