@@ -22,9 +22,12 @@ struct OnlineStatus {
 void netlinkBegin();
 void netlinkConfigure(const NetConfig &config);
 void netlinkNotify();
-// Blocks until any send in progress has finished or aborted; no new
-// attempt starts until netlinkResume(). Used around the settings hotspot.
-void netlinkPause();
+// Blocks (up to 45 s, one bounded request) until any send in progress has
+// finished or aborted; no new attempt starts until netlinkResume(). Returns
+// true when the task is idle and WiFi client mode is off, false on timeout.
+// Call before starting the settings hotspot, and netlinkResume() after
+// stopping it. Safe to call when already paused or before netlinkBegin().
+bool netlinkPause();
 void netlinkResume();
 void netlinkSetSuppressed(bool suppressed);
 OnlineStatus netlinkStatus();

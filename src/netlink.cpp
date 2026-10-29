@@ -18,7 +18,9 @@ constexpr uint32_t NTP_WAIT_MS = 10000;
 constexpr uint32_t MIN_FREE_HEAP = 60UL * 1024UL;
 constexpr uint32_t FIRST_ATTEMPT_DELAY_MS = 60000;
 constexpr uint32_t OFFSET_REFRESH_S = 86400;
-constexpr uint32_t PAUSE_WAIT_MS = 30000;
+// Worst case for one bounded request: 15 s join + 10 s TLS handshake + 10 s HTTP.
+constexpr uint32_t PAUSE_WAIT_MS = 45000;
+constexpr uint32_t MIN_LOOP_MS = 1000;
 
 enum class Attempt : uint8_t { Done, Failed, RateLimited, Paused, Off };
 
@@ -84,6 +86,7 @@ int httpRequest(const char *url, const char *postBody, char *response, size_t re
   if (strncmp(url, "https://", 8) == 0) {
     WiFiClientSecure client;
     client.setInsecure();  // no certificate check, see the spec non-goals
+    client.setHandshakeTimeout(HTTP_TIMEOUT_MS / 1000);  // seconds; the default is 120 s
     return httpRequestWith(client, url, postBody, response, responseCap);
   }
   WiFiClient client;
@@ -115,8 +118,18 @@ bool connectWifi() {
   return false;
 }
 
+bool apActive() {
+  return (WiFi.getMode() & WIFI_AP) != 0;
+}
+
 void wifiOff() {
   sntp_stop();
+  if (apActive()) {
+    // The settings hotspot is up: drop only the client side, never the AP.
+    WiFi.disconnect(true);
+    WiFi.enableSTA(false);
+    return;
+  }
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
 }
@@ -141,7 +154,7 @@ bool fetchOffsetTimeapi(int32_t &offset) {
   char ip[46];
   char url[128];
   if (httpRequest(cs::IP_LOOKUP_URL, nullptr, responseBuffer, sizeof(responseBuffer)) != 200 ||
-      !cs::parsePlainIp(responseBuffer, ip, sizeof(ip)) || !cs::buildTimeapiUrl(ip, url, sizeof(url))) {
+      !cs::parsePlainIp(responseBuffer, ip, sizeof(ip)) || !cs::buildTimeapiUrl(ip, url, sizeof(url)) || paused) {
     return false;
   }
   return httpRequest(url, nullptr, responseBuffer, sizeof(responseBuffer)) == 200 &&
@@ -162,12 +175,19 @@ void refreshOffset() {
     return;
   }
   int32_t offset = 0;
-  if (fetchOffsetTimeapi(offset) || fetchOffsetIpApi(offset)) {
+  if (paused) {
+    return;
+  }
+  bool ok = fetchOffsetTimeapi(offset);
+  if (!ok && paused) {
+    return;  // runAttempt() reports the pause
+  }
+  if (ok || fetchOffsetIpApi(offset)) {
     offsetSeconds = offset;
     offsetKnown = true;
     offsetFetchedUnix = now;
     Serial.printf("Online: UTC offset %ld s\n", static_cast<long>(offset));
-  } else {
+  } else if (!paused) {
     Serial.println("Online: time zone lookup failed");
   }
 }
@@ -194,6 +214,23 @@ void addDelayedSuffix(cs::Message &msg) {
                           millis(),
                           msg.eventMs);
   cs::insertAfterFirstLine(msg.body, sizeof(msg.body), suffix);
+}
+
+// True when the configured URL can be posted to without joining WiFi first.
+bool urlUsable() {
+  if (cs::sinkType(activeConfig.url) == cs::SinkType::Ntfy) {
+    char base[96];
+    char topic[64];
+    return cs::ntfyTarget(activeConfig.url, base, sizeof(base), topic, sizeof(topic));
+  }
+  return strncmp(activeConfig.url, "https://", 8) == 0 || strncmp(activeConfig.url, "http://", 7) == 0;
+}
+
+void stampAttempt() {
+  uint32_t now = static_cast<uint32_t>(time(nullptr));
+  if (cs::clockValid(now)) {
+    lastAttemptUnix = now;
+  }
 }
 
 Attempt resultOf(cs::NetResult result) {
@@ -277,11 +314,19 @@ Attempt sendAll() {
 
 Attempt runAttempt() {
   busy = true;  // set before checking paused, see netlinkPause()
-  if (paused) {
+  if (paused || apActive()) {  // never disturb the settings hotspot
     busy = false;
     return Attempt::Paused;
   }
   if (suppressed || !activeConfig.enabled) {
+    busy = false;
+    return Attempt::Off;
+  }
+  if (!urlUsable()) {
+    // A configuration problem, not a network failure: no WiFi join and no
+    // backoff. OnlineState has no "bad URL" value, so this reports Off.
+    Serial.println("Online: URL is not usable, not sending");
+    onlineState = static_cast<uint8_t>(cs::OnlineState::Off);
     busy = false;
     return Attempt::Off;
   }
@@ -297,15 +342,17 @@ Attempt runAttempt() {
     result = paused ? Attempt::Paused : Attempt::Failed;
     if (!paused) {
       onlineState = static_cast<uint8_t>(cs::OnlineState::NoWifi);
-      lastAttemptUnix = static_cast<uint32_t>(time(nullptr));
+      stampAttempt();
     }
   } else {
     syncClock();
-    refreshOffset();
-    result = sendAll();
+    if (!paused) {
+      refreshOffset();
+    }
+    result = paused ? Attempt::Paused : sendAll();
     if (result != Attempt::Paused) {
       onlineState = static_cast<uint8_t>(result == Attempt::Done ? cs::OnlineState::Sent : cs::OnlineState::Error);
-      lastAttemptUnix = static_cast<uint32_t>(time(nullptr));
+      stampAttempt();
     }
   }
   wifiOff();
@@ -318,8 +365,11 @@ void netTaskMain(void *) {
   bool urgent = false;
   for (;;) {
     uint32_t now = millis();
+    if (backoffActive && static_cast<int32_t>(backoffUntilMs - now) <= 0) {
+      backoffActive = false;  // expired; a stale deadline would compare wrongly after ~24.8 days
+    }
     uint32_t waitMs;
-    if (backoffActive && static_cast<int32_t>(backoffUntilMs - now) > 0) {
+    if (backoffActive) {
       waitMs = backoffUntilMs - now;
     } else if (urgent) {
       waitMs = 0;
@@ -339,7 +389,8 @@ void netTaskMain(void *) {
     taskENTER_CRITICAL(&configMux);
     activeConfig = sharedConfig;
     taskEXIT_CRITICAL(&configMux);
-    nextPeriodicMs = millis() + static_cast<uint32_t>(activeConfig.batchMin) * 60000UL;
+    // 0 (unconfigured) or any invalid value becomes 30 minutes.
+    nextPeriodicMs = millis() + static_cast<uint32_t>(cs::sanitiseBatchMin(activeConfig.batchMin)) * 60000UL;
 
     Attempt result = runAttempt();
     if (result == Attempt::Done) {
@@ -357,8 +408,9 @@ void netTaskMain(void *) {
       Serial.printf("Online: attempt failed, retry in %lu s\n", static_cast<unsigned long>(cs::backoffSeconds(failures)));
     } else if (result == Attempt::Paused) {
       urgent = true;
-      vTaskDelay(pdMS_TO_TICKS(1000));
     }
+    vTaskDelay(pdMS_TO_TICKS(MIN_LOOP_MS));  // at most one attempt per second, whatever happens
+
   }
 }
 
@@ -413,12 +465,14 @@ void netlinkNotify() {
   }
 }
 
-void netlinkPause() {
+bool netlinkPause() {
   paused = true;
   uint32_t start = millis();
   while (busy && millis() - start < PAUSE_WAIT_MS) {
     delay(20);
   }
+  // runAttempt() clears busy only after wifiOff(), so idle means STA is off.
+  return !busy && (WiFi.getMode() & WIFI_STA) == 0;
 }
 
 void netlinkResume() {
