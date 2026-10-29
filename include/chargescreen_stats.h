@@ -202,4 +202,226 @@ inline DrainEvent drainCloseMinute(DrainMonitor &m, float limitA, uint16_t windo
   return DrainEvent::None;
 }
 
+// ---------------------------------------------------------------- samples
+
+// One 10 s snapshot of the dashboard values. Invalid devices have valid=false.
+struct Sample {
+  bool shuntValid = false;
+  float currentA = NAN;    // net shunt current, + = charging
+  float soc = NAN;         // %, 102.3 = "not available"
+  float consumedAh = NAN;  // positive Ah, NAN = unknown
+  bool solarValid = false;
+  float solarBatA = NAN;   // solar charger battery current
+  float pvW = NAN;
+  bool orionValid = false;
+  float orionOutA = NAN;   // Orion XS output current
+};
+
+inline bool socKnown(float soc) {
+  return !std::isnan(soc) && soc >= 0.0f && soc <= 100.05f;
+}
+
+inline float finiteOr0(float v) {
+  return std::isfinite(v) ? v : 0.0f;
+}
+
+// ---------------------------------------------------------------- days
+
+constexpr uint8_t DAY_HISTORY_DAYS = 7;
+constexpr uint32_t DAY_COMPLETE_MIN_SAMPLES = 6480;  // 18 h of 10 s samples
+
+struct DayStats {
+  int32_t day = NO_DAY;  // local day number, see localDayNumber()
+  float netAh = 0.0f;
+  float solarAh = 0.0f;
+  float orionAh = 0.0f;
+  float solarWh = 0.0f;
+  float pvPeakW = 0.0f;
+  int16_t pvPeakMinute = -1;
+  int16_t pvFirstMinute = -1;  // first local minute with PV > 5 W
+  int16_t pvLastMinute = -1;   // last local minute with PV > 5 W
+  uint32_t samples = 0;
+};
+
+// Rectangle rule. Skipped entirely when the shunt is invalid; an invalid
+// solar charger or Orion adds 0 for that device.
+inline void dayAddSample(DayStats &d, const Sample &s, uint32_t dtS, uint16_t localMinute) {
+  if (!s.shuntValid || std::isnan(s.currentA)) {
+    return;
+  }
+  float hours = static_cast<float>(dtS) / 3600.0f;
+  d.netAh += s.currentA * hours;
+  if (s.solarValid) {
+    d.solarAh += finiteOr0(s.solarBatA) * hours;
+    float pv = finiteOr0(s.pvW);
+    d.solarWh += pv * hours;
+    if (pv > PV_PRODUCING_WATTS) {
+      if (d.pvFirstMinute < 0) {
+        d.pvFirstMinute = static_cast<int16_t>(localMinute);
+      }
+      d.pvLastMinute = static_cast<int16_t>(localMinute);
+    }
+    if (pv > d.pvPeakW) {
+      d.pvPeakW = pv;
+      d.pvPeakMinute = static_cast<int16_t>(localMinute);
+    }
+  }
+  if (s.orionValid) {
+    d.orionAh += finiteOr0(s.orionOutA) * hours;
+  }
+  d.samples++;
+}
+
+inline float dayUsedAh(const DayStats &d) {
+  float used = d.solarAh + d.orionAh - d.netAh;
+  return used > 0.0f ? used : 0.0f;
+}
+
+inline bool dayComplete(const DayStats &d) {
+  return d.day != NO_DAY && d.samples >= DAY_COMPLETE_MIN_SAMPLES;
+}
+
+struct DayHistory {
+  DayStats current;
+  DayStats days[DAY_HISTORY_DAYS];  // days[0] = most recent closed day
+  uint8_t count = 0;
+  int32_t morningSentDay = NO_DAY;
+  int32_t eveningSentDay = NO_DAY;
+};
+
+inline void dayHistoryRoll(DayHistory &h, int32_t today) {
+  if (h.current.day == today) {
+    return;
+  }
+  if (h.current.day != NO_DAY) {
+    for (int i = DAY_HISTORY_DAYS - 1; i > 0; --i) {
+      h.days[i] = h.days[i - 1];
+    }
+    h.days[0] = h.current;
+    if (h.count < DAY_HISTORY_DAYS) {
+      h.count++;
+    }
+  }
+  h.current = DayStats();
+  h.current.day = today;
+}
+
+inline const DayStats *dayHistoryFind(const DayHistory &h, int32_t day) {
+  for (uint8_t i = 0; i < h.count; i++) {
+    if (h.days[i].day == day) {
+      return &h.days[i];
+    }
+  }
+  return nullptr;
+}
+
+// ---------------------------------------------------------------- capacity
+
+constexpr float CAPACITY_ALPHA = 0.1f;
+constexpr float CAPACITY_MAX_SOC = 90.0f;
+constexpr float CAPACITY_PERSIST_CHANGE = 0.02f;
+
+struct CapacityLearner {
+  float capacityAh = NAN;
+};
+
+// consumedAh is positive. Returns true when the estimate was updated.
+inline bool capacityUpdate(CapacityLearner &c, float soc, float consumedAh) {
+  if (!socKnown(soc) || soc > CAPACITY_MAX_SOC) {
+    return false;
+  }
+  if (!std::isfinite(consumedAh) || consumedAh <= 0.0f) {
+    return false;
+  }
+  float raw = consumedAh / (1.0f - soc / 100.0f);
+  c.capacityAh = std::isnan(c.capacityAh) ? raw : c.capacityAh + CAPACITY_ALPHA * (raw - c.capacityAh);
+  return true;
+}
+
+inline bool capacityShouldPersist(float learned, float stored) {
+  if (std::isnan(learned)) {
+    return false;
+  }
+  if (std::isnan(stored) || stored <= 0.0f) {
+    return true;
+  }
+  return std::fabs(learned - stored) > CAPACITY_PERSIST_CHANGE * stored;
+}
+
+inline float remainingAh(const CapacityLearner &c, float soc) {
+  if (std::isnan(c.capacityAh) || !socKnown(soc)) {
+    return NAN;
+  }
+  return soc / 100.0f * c.capacityAh;
+}
+
+// ---------------------------------------------------------------- days remaining
+
+struct DaysEstimate {
+  bool valid = false;
+  uint8_t daysUsed = 0;
+  bool showSolar = false;    // two figures: with solar and with no sun
+  bool solarCovers = false;  // avgUsed - avgSolar <= 0
+  float withSolar = NAN;
+  float noSun = NAN;
+};
+
+inline DaysEstimate daysRemaining(const DayHistory &h, uint8_t daysAvg, float remaining, bool hasSolarKey) {
+  DaysEstimate e;
+  if (std::isnan(remaining)) {
+    return e;
+  }
+  float used = 0.0f;
+  float solar = 0.0f;
+  uint8_t n = 0;
+  for (uint8_t i = 0; i < h.count && n < daysAvg; i++) {
+    if (dayComplete(h.days[i])) {
+      used += dayUsedAh(h.days[i]);
+      solar += h.days[i].solarAh;
+      n++;
+    }
+  }
+  if (n == 0) {
+    return e;
+  }
+  float avgUsed = used / n;
+  float avgSolar = solar / n;
+  e.valid = true;
+  e.daysUsed = n;
+  e.noSun = avgUsed > 0.0f ? remaining / avgUsed : INFINITY;
+  e.showSolar = hasSolarKey && avgSolar > 0.0f;
+  if (e.showSolar) {
+    float net = avgUsed - avgSolar;
+    if (net <= 0.0f) {
+      e.solarCovers = true;
+    } else {
+      e.withSolar = remaining / net;
+    }
+  }
+  return e;
+}
+
+// ---------------------------------------------------------------- report timing
+
+inline bool morningDue(int32_t morningSentDay, int32_t localDay, uint16_t localMinute, uint8_t reportHour) {
+  return localDay != morningSentDay && localMinute >= reportHour * 60U;
+}
+
+// SunsetDetector: the evening report is due once per day, after PV exceeded
+// 5 W that day, at or after eveningHour:00 once PV has been <= 5 W for 30
+// minutes, and at 23:00 at the latest.
+inline bool sunsetDue(int32_t eveningSentDay, const DayStats &today, int32_t localDay, uint16_t localMinute,
+                      uint8_t eveningHour) {
+  if (localDay == eveningSentDay || today.day != localDay || today.pvLastMinute < 0) {
+    return false;
+  }
+  if (localMinute < eveningHour * 60U) {
+    return false;
+  }
+  if (localMinute >= EVENING_LATEST_MINUTE) {
+    return true;
+  }
+  return localMinute - today.pvLastMinute >= SUNSET_QUIET_MINUTES;
+}
+
 }  // namespace cs
