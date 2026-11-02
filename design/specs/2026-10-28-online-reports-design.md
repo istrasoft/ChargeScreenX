@@ -145,6 +145,7 @@ The setup page gets a new **Online** section. All values live in the NVS namespa
 | WiFi 1 name / password | `wifi1_ssid`, `wifi1_pass` | empty |
 | WiFi 2 name / password | `wifi2_ssid`, `wifi2_pass` | empty |
 | Send to URL | `post_url` | empty (feature off) |
+| Access token | `post_token` | empty (no `Authorization` header) |
 | Time zone override | `tz_override` | empty (automatic) |
 | Drain limit (A) | `dis_amps` | 4.0 |
 | Drain window (min) | `dis_win_min` | 45 |
@@ -153,7 +154,7 @@ The setup page gets a new **Online** section. All values live in the NVS namespa
 | Batch interval (min) | `batch_min` | 30 |
 | Days to average | `days_avg` | 3 |
 
-The feature is off while `post_url` is empty or no WiFi name is set. Passwords use the existing "leave blank to keep" pattern of the key fields. A **Send test message** button queues a priority-3 message `ChargeScreen test` / `Online sending works.`
+The feature is off while `post_url` is empty or no WiFi name is set. Passwords use the existing "leave blank to keep" pattern of the key fields. The access token (added 2026-11-02, up to 127 printable ASCII characters without spaces) follows the same pattern, has a **Remove saved token** checkbox, and is removed when the URL changes. It is sent as `Authorization: Bearer <token>` on posts to `post_url` only, never on the time zone lookups. A 401 or 403 reply counts as a failure (message kept, backoff), not a drop. A **Send test message** button queues a priority-3 message `ChargeScreen test` / `Online sending works.`
 
 The info screen gets one line, `Online`, showing one of: `Off`, `No WiFi`, `Sent HH:MM`, or `Error HH:MM`.
 
@@ -194,6 +195,7 @@ Rules:
 
 - HTTP 2xx means sent.
 - HTTP 429, or any 5xx, means back off.
+- 401 and 403 (missing or wrong access token) count as failures: the message stays queued.
 - Any other 4xx drops that message, so a bad message doesn't block the queue.
 - Network or TLS errors mean retry later.
 

@@ -57,12 +57,18 @@ void applyTimeZone(const char *tz) {
   tzset();
 }
 
-int httpRequestWith(WiFiClient &client, const char *url, const char *postBody, char *response, size_t responseCap) {
+int httpRequestWith(WiFiClient &client, const char *url, const char *postBody, char *response, size_t responseCap,
+                    const char *token) {
   HTTPClient http;
   http.setConnectTimeout(HTTP_TIMEOUT_MS);
   http.setTimeout(HTTP_TIMEOUT_MS);
   if (!http.begin(client, url)) {
     return -1;
+  }
+  if (token && token[0]) {
+    char auth[cs::POST_TOKEN_MAX + 8];
+    snprintf(auth, sizeof(auth), "Bearer %s", token);
+    http.addHeader("Authorization", auth);
   }
   int code;
   if (postBody) {
@@ -82,16 +88,18 @@ int httpRequestWith(WiFiClient &client, const char *url, const char *postBody, c
   return code;
 }
 
-// Returns the HTTP status, or <= 0 for a network or TLS error.
-int httpRequest(const char *url, const char *postBody, char *response, size_t responseCap) {
+// Returns the HTTP status, or <= 0 for a network or TLS error. Pass a token
+// only for the configured URL, never for the time zone lookups.
+int httpRequest(const char *url, const char *postBody, char *response, size_t responseCap,
+                const char *token = nullptr) {
   if (strncmp(url, "https://", 8) == 0) {
     WiFiClientSecure client;
     client.setInsecure();  // no certificate check, see the spec non-goals
     client.setHandshakeTimeout(HTTP_TIMEOUT_MS / 1000);  // seconds; the default is 120 s
-    return httpRequestWith(client, url, postBody, response, responseCap);
+    return httpRequestWith(client, url, postBody, response, responseCap, token);
   }
   WiFiClient client;
-  return httpRequestWith(client, url, postBody, response, responseCap);
+  return httpRequestWith(client, url, postBody, response, responseCap, token);
 }
 
 bool connectWifi() {
@@ -265,7 +273,7 @@ Attempt sendAll() {
       storePopMessage(id);
       continue;
     }
-    int code = httpRequest(postUrl, envelopeBuffer, nullptr, 0);
+    int code = httpRequest(postUrl, envelopeBuffer, nullptr, 0, activeConfig.token);
     logHeap(cs::kindName(kind), code);
     cs::NetResult result = cs::classifyHttp(code);
     if (result == cs::NetResult::Sent || result == cs::NetResult::Drop) {
@@ -302,7 +310,7 @@ Attempt sendAll() {
       storeMarkRecordsSent(endSeq);
       continue;
     }
-    int code = httpRequest(postUrl, envelopeBuffer, nullptr, 0);
+    int code = httpRequest(postUrl, envelopeBuffer, nullptr, 0, activeConfig.token);
     logHeap("batch", code);
     cs::NetResult result = cs::classifyHttp(code);
     if (result == cs::NetResult::Sent || result == cs::NetResult::Drop) {

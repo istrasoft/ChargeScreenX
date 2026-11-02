@@ -1141,10 +1141,28 @@ inline NetResult classifyHttp(int code) {
   if (code == 429) {
     return NetResult::RateLimited;
   }
+  if (code == 401 || code == 403) {
+    return NetResult::Fail;  // missing or wrong access token: keep the message and retry
+  }
   if (code >= 400 && code < 500) {
     return NetResult::Drop;
   }
   return NetResult::Fail;
+}
+
+constexpr size_t POST_TOKEN_MAX = 127;
+
+// Sent as "Authorization: Bearer <token>". Empty means no token. Only printable
+// ASCII without spaces is accepted, so the token cannot break out of the header.
+inline bool validPostToken(const char *token) {
+  size_t len = 0;
+  for (; token[len]; len++) {
+    unsigned char c = static_cast<unsigned char>(token[len]);
+    if (c <= ' ' || c >= 0x7f || len >= POST_TOKEN_MAX) {
+      return false;
+    }
+  }
+  return true;
 }
 
 constexpr uint8_t BACKOFF_MAX_FAILURES = 5;

@@ -8,6 +8,7 @@ struct NetConfig {
   char ssid[2][33];
   char pass[2][65];
   char url[192];
+  char token[cs::POST_TOKEN_MAX + 1];  // Bearer token for url, empty = none
   char tz[64];  // POSIX TZ override, empty = automatic offset lookup
   uint8_t batchMin;
   bool enabled;

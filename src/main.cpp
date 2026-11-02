@@ -274,6 +274,7 @@ static uint32_t lastPageChangeMs = 0;
 static String onlineWifiSsid[2];
 static String onlineWifiPass[2];
 static String onlinePostUrl;
+static String onlinePostToken;
 static String onlineTzOverride;
 static cs::OnlineSettings onlineSettings;
 static String settingsMessage;
@@ -615,6 +616,7 @@ static void applyOnlineConfig() {
     snprintf(config.pass[n], sizeof(config.pass[n]), "%s", onlineWifiPass[n].c_str());
   }
   snprintf(config.url, sizeof(config.url), "%s", onlinePostUrl.c_str());
+  snprintf(config.token, sizeof(config.token), "%s", onlinePostToken.c_str());
   snprintf(config.tz, sizeof(config.tz), "%s", onlineTzOverride.c_str());
   config.batchMin = onlineSettings.batchMin;
   config.enabled = onlineEnabled();
@@ -656,6 +658,10 @@ static void loadStoredSecrets() {
   onlineWifiSsid[1] = secrets.getString("wifi2_ssid", "");
   onlineWifiPass[1] = secrets.getString("wifi2_pass", "");
   onlinePostUrl = secrets.getString("post_url", "");
+  onlinePostToken = secrets.getString("post_token", "");
+  if (!cs::validPostToken(onlinePostToken.c_str())) {
+    onlinePostToken = "";
+  }
   onlineTzOverride = secrets.getString("tz_override", "");
   onlineSettings.disAmps = cs::sanitiseDisAmps(secrets.getFloat("dis_amps", 4.0f));
   onlineSettings.disWinMin = cs::sanitiseDisWinMin(secrets.getUShort("dis_win_min", 45));
@@ -2019,14 +2025,17 @@ static void appendOnlineSection(String &html) {
   static const uint8_t batchOptions[] = {15, 30, 60};
   static const uint8_t dayOptions[] = {1, 2, 3, 4, 5, 6, 7};
   html += F("<h2>Online</h2>");
-  html += F("<p class='hint'>With a URL and a WiFi network set, ChargeScreen joins WiFi only to send drain alerts, a morning battery report, an evening solar report and a silent data batch. Use an ntfy topic such as https://ntfy.sh/your_topic, or your own endpoint. Nothing is sent in demo mode. Status: ");
+  html += F("<p class='hint'>With a URL and a WiFi network set, ChargeScreen joins WiFi only to send drain alerts, a morning battery report, an evening solar report and a silent data batch. Use an ntfy topic such as https://ntfy.sh/your_topic, or your own endpoint. A protected topic also needs an access token, sent as a Bearer header. Nothing is sent in demo mode. Status: ");
   html += onlineStatusLine();
   html += F("</p>");
   appendWifiFields(html, 1, onlineWifiSsid[0], onlineWifiPass[0]);
   appendWifiFields(html, 2, onlineWifiSsid[1], onlineWifiPass[1]);
   html += F("<label for='post_url'>Send to URL</label><input id='post_url' name='post_url' maxlength='191' autocomplete='off' placeholder='https://ntfy.sh/your_topic' value='");
   html += htmlAttr(onlinePostUrl);
-  html += F("'><label for='tz_override'>Time zone override</label><input id='tz_override' name='tz_override' maxlength='63' autocomplete='off' placeholder='automatic, e.g. CET-1CEST,M3.5.0,M10.5.0/3' value='");
+  html += F("'><label for='post_token'>Access token</label><input id='post_token' name='post_token' type='password' maxlength='127' autocomplete='new-password' placeholder='");
+  html += onlinePostToken.length() ? F("saved") : F("not set, e.g. tk_...");
+  html += F("'><label class='check'><input type='checkbox' name='clear_token' value='1'>Remove saved token</label>");
+  html += F("<label for='tz_override'>Time zone override</label><input id='tz_override' name='tz_override' maxlength='63' autocomplete='off' placeholder='automatic, e.g. CET-1CEST,M3.5.0,M10.5.0/3' value='");
   html += htmlAttr(onlineTzOverride);
   html += F("'><div class='grid'><label for='dis_amps'>Drain limit (A)</label><label for='dis_win_min'>Drain window (min)</label>");
   html += F("<input id='dis_amps' name='dis_amps' type='number' min='0.5' max='50' step='0.1' value='");
@@ -2336,11 +2345,26 @@ static bool saveOnlineSettings() {
                ((url.startsWith("https://") || url.startsWith("http://")) && url.length() <= 191 &&
                 (cs::sinkType(url.c_str()) != cs::SinkType::Ntfy ||
                  cs::ntfyTarget(url.c_str(), base, sizeof(base), topic, sizeof(topic))));
+  bool urlChanged = false;
   if (!urlOk) {
     ok = false;
   } else if (url != onlinePostUrl) {
     onlinePostUrl = url;
     putOrRemove("post_url", url);
+    urlChanged = true;
+  }
+
+  String token = settingsServer.arg("post_token");
+  token.trim();
+  if (!cs::validPostToken(token.c_str())) {
+    ok = false;
+  } else if (token.length() && urlOk) {
+    onlinePostToken = token;
+    secrets.putString("post_token", token);
+  } else if (settingsServer.hasArg("clear_token") || urlChanged) {
+    // Blank keeps the saved token, but never send it to a different URL.
+    onlinePostToken = "";
+    secrets.remove("post_token");
   }
 
   String tz = settingsServer.arg("tz_override");

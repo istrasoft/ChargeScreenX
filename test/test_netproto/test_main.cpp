@@ -101,6 +101,9 @@ static void test_http_classification_and_backoff() {
   TEST_ASSERT_EQUAL(cs::NetResult::RateLimited, cs::classifyHttp(429));
   TEST_ASSERT_EQUAL(cs::NetResult::Drop, cs::classifyHttp(400));
   TEST_ASSERT_EQUAL(cs::NetResult::Drop, cs::classifyHttp(413));
+  // A missing or wrong access token is a setup problem: keep the message.
+  TEST_ASSERT_EQUAL(cs::NetResult::Fail, cs::classifyHttp(401));
+  TEST_ASSERT_EQUAL(cs::NetResult::Fail, cs::classifyHttp(403));
   TEST_ASSERT_EQUAL(cs::NetResult::Fail, cs::classifyHttp(500));
   TEST_ASSERT_EQUAL(cs::NetResult::Fail, cs::classifyHttp(503));
   TEST_ASSERT_EQUAL(cs::NetResult::Fail, cs::classifyHttp(-1));
@@ -180,6 +183,23 @@ static void test_queue_drops_oldest_when_full() {
   TEST_ASSERT_EQUAL_INT16(1, cs::queueOldestSlot(q));
 }
 
+static void test_post_token_validation() {
+  TEST_ASSERT_TRUE(cs::validPostToken(""));  // no token
+  TEST_ASSERT_TRUE(cs::validPostToken("tk_AgQdq7mVBoFD37zQVN29RhuMzNIz2"));
+  TEST_ASSERT_TRUE(cs::validPostToken("abc.DEF-123_~+/="));  // JWT or base64 style
+  TEST_ASSERT_FALSE(cs::validPostToken("tk_abc\r\nX-Evil: 1"));  // header injection
+  TEST_ASSERT_FALSE(cs::validPostToken("tk abc"));
+  TEST_ASSERT_FALSE(cs::validPostToken("tk_\x7f"));
+  TEST_ASSERT_FALSE(cs::validPostToken("caf\xc3\xa9"));
+  char longest[cs::POST_TOKEN_MAX + 2];
+  memset(longest, 'a', sizeof(longest));
+  longest[cs::POST_TOKEN_MAX] = '\0';
+  TEST_ASSERT_TRUE(cs::validPostToken(longest));
+  longest[cs::POST_TOKEN_MAX] = 'a';
+  longest[cs::POST_TOKEN_MAX + 1] = '\0';
+  TEST_ASSERT_FALSE(cs::validPostToken(longest));
+}
+
 static void test_queue_pop_and_morning_replacement() {
   cs::QueueIndex q;
   uint32_t alertId = 0;
@@ -212,5 +232,6 @@ int main(int, char **) {
   RUN_TEST(test_record_send_action_and_fill);
   RUN_TEST(test_queue_drops_oldest_when_full);
   RUN_TEST(test_queue_pop_and_morning_replacement);
+  RUN_TEST(test_post_token_validation);
   return UNITY_END();
 }
