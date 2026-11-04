@@ -40,7 +40,12 @@ ChargeScreen can join WiFi only when it has something to send, and push to an HT
 - a high-drain alert when the battery discharges faster than a limit over a rolling window (default 4.0 A over 45 minutes), and an all-clear when it is back to normal;
 - a morning battery report (default 10:00) with an estimate of the days remaining;
 - an evening solar report (default 20:00, after production ends, 23:00 at the latest);
-- a silent data batch of 5-minute records (default every 30 minutes).
+- a silent data batch of 5-minute records (default every 30 minutes). Each record also carries the engine-running seconds (`eng`), the solar-producing seconds (`pvs`) and the Orion XS input voltage (`sv`);
+- after a drive of at least 10 minutes, a **Parked** message about 3 minutes after the engine stops. It carries the position, looked up from nearby Wi-Fi networks with Google's Geolocation API (needs a **Google geolocation key**; unchanged surroundings reuse the last position without a call), and the 4G signal read from a TP-Link Deco (needs the **Deco password**; run `tools/deco-probe` first to check your model works);
+- a **Starter battery low** alert when the Orion XS input stays below 12.2 V for 30 minutes, at least an hour after the engine stopped;
+- a **Van moved?** alert when the Wi-Fi networks around the parked van change completely (checked hourly) without the engine running, followed by a new Parked message.
+
+The batch interval can also be changed on the device: settings page 3, **Send** row (15m, 30m, 1h, 2h, 4h, or `-` for Off). With Off, records are only sent along with other messages.
 
 Set it up in the **Online** section of the setup page: up to two WiFi networks, the URL, and optionally a POSIX time zone such as `CET-1CEST,M3.5.0,M10.5.0/3` (otherwise the time zone is looked up from the IP address once a day). Use an ntfy topic URL such as `https://ntfy.sh/your_topic` and subscribe to it in the ntfy app, or your own endpoint, which receives JSON (`{"v":1,"kind":...,"title":...,"message":...,"priority":...,"time":...,"data":{...}}`). For a protected ntfy topic (or an endpoint that needs a key), set **Access token**: it is sent as `Authorization: Bearer <token>` only to that URL, and changing the URL removes it. A 401 or 403 reply keeps the messages queued and shows `Error` until the token is fixed. **Send test message** checks the setup once the hotspot turns off. The info screen shows `Online: Off`, `Waiting`, `No WiFi`, `Sent HH:MM` or `Error HH:MM`.
 
