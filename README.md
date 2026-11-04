@@ -40,7 +40,7 @@ ChargeScreen can join WiFi only when it has something to send, and push to an HT
 - a high-drain alert when the battery discharges faster than a limit over a rolling window (default 4.0 A over 45 minutes), and an all-clear when it is back to normal;
 - a morning battery report (default 10:00) with an estimate of the days remaining;
 - an evening solar report (default 20:00, after production ends, 23:00 at the latest);
-- a silent data batch of 5-minute records (default every 30 minutes). Each record also carries the engine-running seconds (`eng`), the solar-producing seconds (`pvs`) and the Orion XS input voltage (`sv`);
+- a silent data batch of 5-minute records (default every 30 minutes). Each record also carries the engine-running seconds (`eng`), the solar-producing seconds (`pvs`), the Orion XS input voltage (`sv`) and the solar charger's battery current (`sa`, A). An online dashboard for these records is [HarmonyDash](https://github.com/istrasoft/HarmonyDash);
 - after a drive of at least 10 minutes, a **Parked** message about 3 minutes after the engine stops. It carries the position, looked up from nearby Wi-Fi networks with Google's Geolocation API (needs a **Google geolocation key**; unchanged surroundings reuse the last position without a call), and the 4G signal read from a TP-Link Deco (needs the **Deco password**; run `tools/deco-probe` first to check your model works);
 - a **Starter battery low** alert when the Orion XS input stays below 12.2 V for 30 minutes, at least an hour after the engine stopped;
 - a **Van moved?** alert when the Wi-Fi networks around the parked van change completely (checked hourly) without the engine running, followed by a new Parked message.
