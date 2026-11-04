@@ -36,6 +36,7 @@ static cs::Record worstCaseRecord() {
   r.engS = 65534;
   r.pvS = 65534;
   r.sv = -9999.9f;
+  r.sa = -9999.9f;
   return r;
 }
 
@@ -50,10 +51,13 @@ static void test_record_engine_solar_seconds_and_starter() {
     s.orionState = k < 20 ? 3 : 0;       // 20 samples running
     s.orionInV = k < 20 ? 14.0f : 12.5f;
     s.pvW = k < 12 ? 50.0f : 4.0f;       // 12 samples producing
+    s.solarBatA = k < 12 ? 3.5f : 0.0f;
     cs::recordAdd(b, s);
   }
   s.orionInV = 0.0f;  // disconnected input is ignored
   s.orionState = 0;
+  s.solarValid = false;  // ignored for sa
+  s.solarBatA = 99.0f;
   cs::recordAdd(b, s);
   cs::Record r = cs::recordClose(b);
   TEST_ASSERT_EQUAL_UINT16(200, r.engS);
@@ -61,7 +65,8 @@ static void test_record_engine_solar_seconds_and_starter() {
   TEST_ASSERT_FLOAT_WITHIN(0.01f, (20 * 14.0f + 10 * 12.5f) / 30.0f, r.sv);
   char out[cs::BATCH_JSON_MAX];
   TEST_ASSERT_TRUE(cs::buildBatchJson(out, sizeof out, &r, 1) > 0);
-  TEST_ASSERT_NOT_NULL(strstr(out, ",\"eng\":200,\"pvs\":120,\"sv\":13.5}"));
+  TEST_ASSERT_FLOAT_WITHIN(0.01f, 12 * 3.5f / 30.0f, r.sa);
+  TEST_ASSERT_NOT_NULL(strstr(out, ",\"eng\":200,\"pvs\":120,\"sv\":13.5,\"sa\":1.4}"));
 
   cs::RecordBuilder none;
   cs::recordStart(none, 1793174400UL, 0, 1);
@@ -73,6 +78,7 @@ static void test_record_engine_solar_seconds_and_starter() {
   TEST_ASSERT_NULL(strstr(out, "eng"));
   TEST_ASSERT_NULL(strstr(out, "pvs"));
   TEST_ASSERT_NULL(strstr(out, "sv"));
+  TEST_ASSERT_NULL(strstr(out, "sa"));
 }
 
 static void test_record_builder_averages_and_extremes() {

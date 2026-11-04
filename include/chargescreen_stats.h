@@ -847,7 +847,7 @@ inline void onlineStatusText(OnlineState state, int16_t localMinute, char *out, 
 
 // ---------------------------------------------------------------- records
 
-constexpr size_t BATCH_JSON_MAX = 2048;
+constexpr size_t BATCH_JSON_MAX = 2304;
 constexpr size_t ENVELOPE_MAX = 4608;
 
 constexpr uint16_t NO_SECONDS = 0xFFFF;  // engS / pvS: device had no valid sample
@@ -869,8 +869,9 @@ struct Record {
   float sv = NAN;             // average Orion input voltage
   uint16_t pvS = NO_SECONDS;  // seconds with PV above PV_PRODUCING_WATTS
   uint16_t reserved = 0;
+  float sa = NAN;             // average solar charger battery current
 };
-static_assert(sizeof(Record) == 52, "Record layout is stored on flash");
+static_assert(sizeof(Record) == 56, "Record layout is stored on flash");
 
 struct RecordBuilder {
   Record rec;
@@ -881,6 +882,8 @@ struct RecordBuilder {
   uint16_t engSamples = 0;   // of those, engine running
   uint16_t pvOnSamples = 0;  // valid PV samples above PV_PRODUCING_WATTS
   uint16_t svCount = 0;
+  uint16_t saCount = 0;
+  float saSum = 0.0f;
   float currentSum = 0.0f;
   float pvSum = 0.0f;
   float orionSum = 0.0f;
@@ -926,6 +929,10 @@ inline void recordAdd(RecordBuilder &b, const Sample &s) {
       b.pvOnSamples++;
     }
   }
+  if (s.solarValid && std::isfinite(s.solarBatA)) {
+    b.saSum += s.solarBatA;
+    b.saCount++;
+  }
   if (s.orionValid && std::isfinite(s.orionOutA)) {
     b.orionSum += s.orionOutA;
     b.orionCount++;
@@ -950,6 +957,7 @@ inline Record recordClose(const RecordBuilder &b) {
   r.engS = b.orionSeen ? samplesToSeconds(b.engSamples) : NO_SECONDS;
   r.pvS = b.pvCount ? samplesToSeconds(b.pvOnSamples) : NO_SECONDS;
   r.sv = b.svCount ? b.svSum / b.svCount : NAN;
+  r.sa = b.saCount ? b.saSum / b.saCount : NAN;
   return r;
 }
 
@@ -991,6 +999,7 @@ inline size_t buildBatchJson(char *out, size_t cap, const Record *recs, uint8_t 
       w.putf(",\"pvs\":%u", static_cast<unsigned>(r.pvS));
     }
     putField1(w, "sv", r.sv);
+    putField1(w, "sa", r.sa);
     w.putChar('}');
   }
   w.putStr("]}");
