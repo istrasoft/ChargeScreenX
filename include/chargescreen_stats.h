@@ -67,8 +67,39 @@ inline uint8_t sanitiseEveningHour(int v) {
   return static_cast<uint8_t>(clampInt(v, 16, 22));
 }
 
+// Batch send interval in minutes; 0 = Off (no periodic batches).
 inline uint8_t sanitiseBatchMin(int v) {
-  return (v == 15 || v == 30 || v == 60) ? static_cast<uint8_t>(v) : 30;
+  return (v == 0 || v == 15 || v == 30 || v == 60 || v == 120 || v == 240) ? static_cast<uint8_t>(v) : 30;
+}
+
+// On-device Send row: 15m -> 30m -> 1h -> 2h -> 4h -> Off -> 15m.
+inline uint8_t nextBatchMin(uint8_t v) {
+  switch (sanitiseBatchMin(v)) {
+    case 15:
+      return 30;
+    case 30:
+      return 60;
+    case 60:
+      return 120;
+    case 120:
+      return 240;
+    case 240:
+      return 0;
+    default:
+      return 15;
+  }
+}
+
+// "15m", "30m", "1h", "2h", "4h", or "-" for Off.
+inline void batchMinText(uint8_t v, char *out, size_t cap) {
+  uint8_t m = sanitiseBatchMin(v);
+  if (m == 0) {
+    snprintf(out, cap, "-");
+  } else if (m < 60) {
+    snprintf(out, cap, "%um", static_cast<unsigned>(m));
+  } else {
+    snprintf(out, cap, "%uh", static_cast<unsigned>(m / 60));
+  }
 }
 
 inline uint8_t sanitiseDaysAvg(int v) {
@@ -215,7 +246,22 @@ struct Sample {
   float pvW = NAN;
   bool orionValid = false;
   float orionOutA = NAN;   // Orion XS output current
+  uint8_t orionState = 0xFF;  // Orion XS device state, 0 = Off
+  float orionInV = NAN;       // Orion XS input voltage (starter battery or alternator)
 };
+
+constexpr float STARTER_MIN_V = 5.0f;   // below: input disconnected
+constexpr float STARTER_MAX_V = 20.0f;
+
+inline bool starterVoltageUsable(float v) {
+  return std::isfinite(v) && v >= STARTER_MIN_V && v <= STARTER_MAX_V;
+}
+
+// The Orion XS follows the ignition: any known state other than Off means
+// the engine (alternator) is running.
+inline bool orionEngineRunning(uint8_t state) {
+  return state != 0 && state != 0xFF;
+}
 
 inline bool socKnown(float soc) {
   return !std::isnan(soc) && soc >= 0.0f && soc <= 100.05f;
@@ -496,7 +542,17 @@ struct TextWriter {
 
 // ---------------------------------------------------------------- messages
 
-enum class MsgKind : uint8_t { Alert = 0, Clear = 1, Morning = 2, Evening = 3, Batch = 4, Test = 5 };
+enum class MsgKind : uint8_t {
+  Alert = 0,
+  Clear = 1,
+  Morning = 2,
+  Evening = 3,
+  Batch = 4,
+  Test = 5,
+  Park = 6,
+  Starter = 7,
+  Moved = 8
+};
 
 constexpr const char *TEST_BODY = "Online sending works.";
 
@@ -512,6 +568,12 @@ inline const char *kindName(MsgKind k) {
       return "evening";
     case MsgKind::Batch:
       return "batch";
+    case MsgKind::Park:
+      return "park";
+    case MsgKind::Starter:
+      return "starter";
+    case MsgKind::Moved:
+      return "moved";
     default:
       return "test";
   }
@@ -529,6 +591,12 @@ inline const char *kindTitle(MsgKind k) {
       return "Solar today";
     case MsgKind::Batch:
       return "ChargeScreen data";
+    case MsgKind::Park:
+      return "Parked";
+    case MsgKind::Starter:
+      return "Starter battery low";
+    case MsgKind::Moved:
+      return "Van moved?";
     default:
       return "ChargeScreen test";
   }
@@ -545,14 +613,31 @@ inline const char *kindTag(MsgKind k) {
       return "sunny";
     case MsgKind::Evening:
       return "city_sunset";
+    case MsgKind::Park:
+      return "parking";
+    case MsgKind::Starter:
+      return "battery";
+    case MsgKind::Moved:
+      return "rotating_light";
     default:
       return "";
   }
 }
 
-// ntfy levels: 1 = min (silent), 3 = default, 4 = high.
+// ntfy levels: 1 = min (silent), 2 = low (no sound), 3 = default, 4 = high.
 inline uint8_t kindPriority(MsgKind k) {
-  return k == MsgKind::Alert ? 4 : (k == MsgKind::Batch ? 1 : 3);
+  switch (k) {
+    case MsgKind::Alert:
+    case MsgKind::Starter:
+    case MsgKind::Moved:
+      return 4;
+    case MsgKind::Batch:
+      return 1;
+    case MsgKind::Park:
+      return 2;
+    default:
+      return 3;
+  }
 }
 
 constexpr size_t MSG_TITLE_LEN = 48;
@@ -765,12 +850,14 @@ inline void onlineStatusText(OnlineState state, int16_t localMinute, char *out, 
 constexpr size_t BATCH_JSON_MAX = 2048;
 constexpr size_t ENVELOPE_MAX = 4608;
 
+constexpr uint16_t NO_SECONDS = 0xFFFF;  // engS / pvS: device had no valid sample
+
 // One 5-minute record, stored as-is in /tx_cache.bin. NAN = no valid data.
 struct Record {
   uint32_t t = 0;        // start, unix seconds; 0 until the clock is known
   uint32_t startMs = 0;  // millis() at the start, meaningful while boot matches
   uint16_t boot = 0;
-  uint16_t reserved = 0;
+  uint16_t engS = NO_SECONDS;  // seconds with the engine running
   float soc = NAN;
   float used = NAN;
   float i = NAN;
@@ -779,18 +866,31 @@ struct Record {
   float pv = NAN;
   float pvmax = NAN;
   float orion = NAN;
+  float sv = NAN;             // average Orion input voltage
+  uint16_t pvS = NO_SECONDS;  // seconds with PV above PV_PRODUCING_WATTS
+  uint16_t reserved = 0;
 };
-static_assert(sizeof(Record) == 44, "Record layout is stored on flash");
+static_assert(sizeof(Record) == 52, "Record layout is stored on flash");
 
 struct RecordBuilder {
   Record rec;
   uint16_t shuntCount = 0;
   uint16_t pvCount = 0;
   uint16_t orionCount = 0;
+  uint16_t orionSeen = 0;    // valid Orion samples (state known)
+  uint16_t engSamples = 0;   // of those, engine running
+  uint16_t pvOnSamples = 0;  // valid PV samples above PV_PRODUCING_WATTS
+  uint16_t svCount = 0;
   float currentSum = 0.0f;
   float pvSum = 0.0f;
   float orionSum = 0.0f;
+  float svSum = 0.0f;
 };
+
+inline uint16_t samplesToSeconds(uint16_t samples) {
+  uint32_t s = static_cast<uint32_t>(samples) * (SAMPLE_PERIOD_MS / 1000U);
+  return static_cast<uint16_t>(s < NO_SECONDS ? s : NO_SECONDS - 1);
+}
 
 inline void recordStart(RecordBuilder &b, uint32_t unixOr0, uint32_t nowMs, uint16_t boot) {
   b = RecordBuilder();
@@ -822,10 +922,23 @@ inline void recordAdd(RecordBuilder &b, const Sample &s) {
     }
     b.pvSum += s.pvW;
     b.pvCount++;
+    if (s.pvW > PV_PRODUCING_WATTS) {
+      b.pvOnSamples++;
+    }
   }
   if (s.orionValid && std::isfinite(s.orionOutA)) {
     b.orionSum += s.orionOutA;
     b.orionCount++;
+  }
+  if (s.orionValid) {
+    b.orionSeen++;
+    if (orionEngineRunning(s.orionState)) {
+      b.engSamples++;
+    }
+    if (starterVoltageUsable(s.orionInV)) {
+      b.svSum += s.orionInV;
+      b.svCount++;
+    }
   }
 }
 
@@ -834,6 +947,9 @@ inline Record recordClose(const RecordBuilder &b) {
   r.i = b.shuntCount ? b.currentSum / b.shuntCount : NAN;
   r.pv = b.pvCount ? b.pvSum / b.pvCount : NAN;
   r.orion = b.orionCount ? b.orionSum / b.orionCount : NAN;
+  r.engS = b.orionSeen ? samplesToSeconds(b.engSamples) : NO_SECONDS;
+  r.pvS = b.pvCount ? samplesToSeconds(b.pvOnSamples) : NO_SECONDS;
+  r.sv = b.svCount ? b.svSum / b.svCount : NAN;
   return r;
 }
 
@@ -868,6 +984,13 @@ inline size_t buildBatchJson(char *out, size_t cap, const Record *recs, uint8_t 
     putField0(w, "pv", r.pv);
     putField0(w, "pvmax", r.pvmax);
     putField1(w, "or", r.orion);
+    if (r.engS != NO_SECONDS) {
+      w.putf(",\"eng\":%u", static_cast<unsigned>(r.engS));
+    }
+    if (r.pvS != NO_SECONDS) {
+      w.putf(",\"pvs\":%u", static_cast<unsigned>(r.pvS));
+    }
+    putField1(w, "sv", r.sv);
     w.putChar('}');
   }
   w.putStr("]}");
@@ -962,9 +1085,9 @@ inline bool ntfyTarget(const char *url, char *base, size_t baseCap, char *topic,
   return true;
 }
 
-// {"topic":..,"title":..,"message":..,"priority":N[,"tags":[tag]]}
+// {"topic":..,"title":..,"message":..,"priority":N[,"tags":[tag]][,"click":url]}
 inline size_t buildNtfyEnvelope(char *out, size_t cap, const char *topic, const char *title, const char *message,
-                                uint8_t priority, const char *tag) {
+                                uint8_t priority, const char *tag, const char *click = nullptr) {
   TextWriter w(out, cap);
   w.putStr("{\"topic\":\"");
   w.putEscaped(topic);
@@ -977,6 +1100,11 @@ inline size_t buildNtfyEnvelope(char *out, size_t cap, const char *topic, const 
     w.putStr(",\"tags\":[\"");
     w.putEscaped(tag);
     w.putStr("\"]");
+  }
+  if (click && click[0]) {
+    w.putStr(",\"click\":\"");
+    w.putEscaped(click);
+    w.putChar('"');
   }
   w.putChar('}');
   return w.result();
@@ -1297,6 +1425,643 @@ inline int32_t tmOffsetSeconds(int localYear, int localYday, int32_t localSecOfD
     dayDiff = localYday - utcYday;
   }
   return dayDiff * 86400 + localSecOfDay - utcSecOfDay;
+}
+
+// ---------------------------------------------------------------- engine and parking
+
+constexpr uint32_t ENGINE_RUN_MIN_MS = 10UL * 60000UL;  // shorter runs are not a drive
+constexpr uint32_t PARK_SETTLE_MS = 3UL * 60000UL;      // engine off this long ends the drive
+constexpr uint32_t ENGINE_INVALID_DROP_MS = 60000UL;    // Orion lost this long drops a drive
+
+struct EngineTracker {
+  bool inRun = false;
+  uint32_t runStartMs = 0;
+  uint32_t lastRunningMs = 0;
+  uint32_t lastValidMs = 0;
+};
+
+struct ParkTrigger {
+  bool fired = false;
+  uint32_t runS = 0;   // first to last running sample
+  uint32_t offMs = 0;  // millis() of the last running sample
+};
+
+// Feed every 10 s sample. Off periods shorter than PARK_SETTLE_MS stay part
+// of the drive; a drive of ENGINE_RUN_MIN_MS or more fires once when the
+// engine has been off for PARK_SETTLE_MS.
+inline ParkTrigger engineUpdate(EngineTracker &e, bool valid, bool running, uint32_t nowMs) {
+  ParkTrigger t;
+  if (!valid) {
+    if (e.inRun && nowMs - e.lastValidMs > ENGINE_INVALID_DROP_MS) {
+      e.inRun = false;
+    }
+    return t;
+  }
+  e.lastValidMs = nowMs;
+  if (running) {
+    if (!e.inRun) {
+      e.inRun = true;
+      e.runStartMs = nowMs;
+    }
+    e.lastRunningMs = nowMs;
+    return t;
+  }
+  if (e.inRun && nowMs - e.lastRunningMs >= PARK_SETTLE_MS) {
+    e.inRun = false;
+    uint32_t runMs = e.lastRunningMs - e.runStartMs;
+    if (runMs >= ENGINE_RUN_MIN_MS) {
+      t.fired = true;
+      t.runS = runMs / 1000U;
+      t.offMs = e.lastRunningMs;
+    }
+  }
+  return t;
+}
+
+// Handed from telemetry (loop()) to netlink.
+struct ParkRequest {
+  uint32_t offUnix = 0;  // 0 = clock unknown at engine off
+  uint32_t offMs = 0;
+  uint32_t runS = 0;
+  uint16_t boot = 0;
+  uint8_t attempts = 0;
+};
+
+inline void putDuration(TextWriter &w, uint32_t seconds) {
+  uint32_t minutes = (seconds + 30U) / 60U;
+  if (minutes >= 60U) {
+    w.putf("%lu h %lu min", static_cast<unsigned long>(minutes / 60U), static_cast<unsigned long>(minutes % 60U));
+  } else {
+    w.putf("%lu min", static_cast<unsigned long>(minutes));
+  }
+}
+
+// ---------------------------------------------------------------- starter battery
+
+constexpr uint32_t STARTER_SETTLE_MS = 60UL * 60000UL;  // ignore the first hour after engine off
+constexpr uint32_t STARTER_LOW_MS = 30UL * 60000UL;     // low (or recovered) this long
+constexpr float STARTER_LOW_V = 12.2f;
+constexpr float STARTER_RECOVER_V = 12.6f;
+
+struct StarterWatch {
+  bool offKnown = false;
+  uint32_t offSinceMs = 0;
+  bool engineSeen = false;  // offSinceMs is a real engine-off time
+  bool lowActive = false;
+  uint32_t lowSinceMs = 0;
+  float lowMin = NAN;
+  bool highActive = false;
+  uint32_t highSinceMs = 0;
+  bool alerted = false;
+};
+
+struct StarterAlert {
+  bool fired = false;
+  float volts = NAN;  // lowest voltage in the low period
+  bool offForKnown = false;
+  uint32_t offForS = 0;
+};
+
+inline StarterAlert starterUpdate(StarterWatch &w, bool valid, uint8_t state, float inputV, uint32_t nowMs) {
+  StarterAlert a;
+  if (!valid) {
+    return a;
+  }
+  if (orionEngineRunning(state)) {
+    w = StarterWatch();  // re-arm and restart the settle time
+    w.engineSeen = true;
+    return a;
+  }
+  if (!w.offKnown) {
+    w.offKnown = true;
+    w.offSinceMs = nowMs;
+  }
+  if (!starterVoltageUsable(inputV) || nowMs - w.offSinceMs < STARTER_SETTLE_MS) {
+    return a;
+  }
+  if (inputV < STARTER_LOW_V) {
+    w.highActive = false;
+    if (!w.lowActive) {
+      w.lowActive = true;
+      w.lowSinceMs = nowMs;
+      w.lowMin = inputV;
+    } else if (inputV < w.lowMin) {
+      w.lowMin = inputV;
+    }
+    if (!w.alerted && nowMs - w.lowSinceMs >= STARTER_LOW_MS) {
+      w.alerted = true;
+      a.fired = true;
+      a.volts = w.lowMin;
+      a.offForKnown = w.engineSeen;
+      a.offForS = (nowMs - w.offSinceMs) / 1000U;
+    }
+    return a;
+  }
+  w.lowActive = false;
+  if (inputV >= STARTER_RECOVER_V) {
+    if (!w.highActive) {
+      w.highActive = true;
+      w.highSinceMs = nowMs;
+    } else if (w.alerted && nowMs - w.highSinceMs >= STARTER_LOW_MS) {
+      w.alerted = false;
+    }
+  } else {
+    w.highActive = false;
+  }
+  return a;
+}
+
+inline size_t buildStarterBody(char *out, size_t cap, const StarterAlert &a) {
+  TextWriter w(out, cap);
+  w.putf("Starter battery at %.1f V", static_cast<double>(a.volts));
+  if (a.offForKnown) {
+    w.putStr(", engine off for ");
+    putDuration(w, a.offForS);
+  }
+  w.putStr(". Start the engine or charge it soon.");
+  return w.result();
+}
+
+constexpr const char *MOVED_BODY =
+    "The Wi-Fi networks around the van changed while the engine was off. It may have been moved.";
+
+// ---------------------------------------------------------------- Wi-Fi geolocation
+
+constexpr uint8_t GEO_SCAN_MAX = 32;   // usable access points kept from one scan
+constexpr uint8_t GEO_KEEP_APS = 15;   // sent to Google and saved as the reference
+constexpr uint8_t GEO_COMPARE_APS = 10;
+constexpr uint8_t GEO_MIN_APS = 2;
+constexpr uint8_t GEO_MAX_CALLS_PER_DAY = 20;
+constexpr uint8_t PARK_MAX_ATTEMPTS = 3;
+constexpr uint8_t WATCH_APS = 10;
+constexpr uint8_t WATCH_MIN_APS = 3;
+constexpr uint8_t GEO_STATE_VERSION = 1;
+constexpr size_t GEO_KEY_MAX = 64;
+constexpr const char *GEO_URL_PREFIX = "https://www.googleapis.com/geolocation/v1/geolocate?key=";
+
+struct ApInfo {
+  uint8_t bssid[6] = {};
+  int8_t rssi = -127;
+  uint8_t channel = 0;
+};
+
+// Own networks (they travel with the van), locally administered MACs (phone
+// hotspots, randomised MACs) and "_nomap" networks are never used.
+inline bool apUsable(const char *ssid, const uint8_t *bssid, const char *own1, const char *own2) {
+  if (bssid[0] & 0x02) {
+    return false;
+  }
+  if (ssid && ssid[0]) {
+    if (own1 && own1[0] && strcmp(ssid, own1) == 0) {
+      return false;
+    }
+    if (own2 && own2[0] && strcmp(ssid, own2) == 0) {
+      return false;
+    }
+    size_t len = strlen(ssid);
+    if (len >= 6 && strcmp(ssid + len - 6, "_nomap") == 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Sorts strongest first; returns how many to keep.
+inline uint8_t apKeepStrongest(ApInfo *aps, uint8_t n, uint8_t keep) {
+  for (uint8_t i = 1; i < n; i++) {
+    ApInfo v = aps[i];
+    int j = static_cast<int>(i) - 1;
+    while (j >= 0 && aps[j].rssi < v.rssi) {
+      aps[j + 1] = aps[j];
+      j--;
+    }
+    aps[j + 1] = v;
+  }
+  return n < keep ? n : keep;
+}
+
+// How many of the first `compare` access points appear in ref.
+inline uint8_t apOverlapCount(const ApInfo *aps, uint8_t n, const uint8_t (*ref)[6], uint8_t refCount,
+                              uint8_t compare) {
+  uint8_t k = n < compare ? n : compare;
+  uint8_t matches = 0;
+  for (uint8_t i = 0; i < k; i++) {
+    for (uint8_t j = 0; j < refCount; j++) {
+      if (memcmp(aps[i].bssid, ref[j], 6) == 0) {
+        matches++;
+        break;
+      }
+    }
+  }
+  return matches;
+}
+
+// Stored as-is in /lastfix.bin.
+struct GeoState {
+  uint8_t version = GEO_STATE_VERSION;
+  uint8_t refCount = 0;
+  uint8_t calls = 0;
+  uint8_t refused = 0;
+  int32_t budgetDay = NO_DAY;
+  float lat = NAN;
+  float lon = NAN;
+  uint32_t acc = 0;
+  uint32_t fixUnix = 0;
+  uint8_t ref[GEO_KEEP_APS][6] = {};
+  uint8_t watchCount = 0;
+  uint8_t watchActive = 0;
+  uint8_t watchRef[WATCH_APS][6] = {};
+};
+
+inline bool geoStateValid(const GeoState &g) {
+  return g.version == GEO_STATE_VERSION && g.refCount <= GEO_KEEP_APS && g.watchCount <= WATCH_APS;
+}
+
+// At least half of the strongest (rounded up) were in the last Google fix.
+inline bool samePlace(const GeoState &g, const ApInfo *aps, uint8_t n) {
+  if (g.refCount == 0 || n == 0 || !std::isfinite(g.lat) || !std::isfinite(g.lon)) {
+    return false;
+  }
+  uint8_t k = n < GEO_COMPARE_APS ? n : GEO_COMPARE_APS;
+  return apOverlapCount(aps, n, g.ref, g.refCount, GEO_COMPARE_APS) * 2U >= k;
+}
+
+inline bool geoBudgetAllows(GeoState &g, int32_t today) {
+  if (g.budgetDay != today) {
+    g.budgetDay = today;
+    g.calls = 0;
+    g.refused = 0;
+  }
+  return !g.refused && g.calls < GEO_MAX_CALLS_PER_DAY;
+}
+
+enum class ParkSrc : uint8_t { Google, Same, None, Quota, Error };
+enum class GeoStep : uint8_t { Saved, Skip, Call };
+
+inline const char *parkSrcName(ParkSrc s) {
+  switch (s) {
+    case ParkSrc::Google:
+      return "google";
+    case ParkSrc::Same:
+      return "same";
+    case ParkSrc::Quota:
+      return "quota";
+    case ParkSrc::Error:
+      return "error";
+    default:
+      return "none";
+  }
+}
+
+// Same place first (no call), then too few networks or no key, then the budget.
+inline GeoStep geoDecide(GeoState &g, const ApInfo *aps, uint8_t n, bool haveKey, int32_t today, ParkSrc &skipSrc) {
+  if (samePlace(g, aps, n)) {
+    return GeoStep::Saved;
+  }
+  if (n < GEO_MIN_APS || !haveKey) {
+    skipSrc = ParkSrc::None;
+    return GeoStep::Skip;
+  }
+  if (!geoBudgetAllows(g, today)) {
+    skipSrc = ParkSrc::Quota;
+    return GeoStep::Skip;
+  }
+  return GeoStep::Call;
+}
+
+inline void geoRemember(GeoState &g, const ApInfo *aps, uint8_t n, double lat, double lon, double acc,
+                        uint32_t unixNow) {
+  uint8_t k = n < GEO_KEEP_APS ? n : GEO_KEEP_APS;
+  for (uint8_t i = 0; i < k; i++) {
+    memcpy(g.ref[i], aps[i].bssid, 6);
+  }
+  g.refCount = k;
+  g.lat = static_cast<float>(lat);
+  g.lon = static_cast<float>(lon);
+  g.acc = acc > 0.0 ? static_cast<uint32_t>(acc + 0.5) : 0;
+  g.fixUnix = unixNow;
+}
+
+inline void watchSetReference(GeoState &g, const ApInfo *aps, uint8_t n) {
+  uint8_t k = n < WATCH_APS ? n : WATCH_APS;
+  for (uint8_t i = 0; i < k; i++) {
+    memcpy(g.watchRef[i], aps[i].bssid, 6);
+  }
+  g.watchCount = k;
+  g.watchActive = k >= WATCH_MIN_APS ? 1 : 0;
+}
+
+// Enough networks now and none of the strongest seen at the parking.
+inline bool watchSuspicious(const GeoState &g, const ApInfo *aps, uint8_t n) {
+  return g.watchActive && g.watchCount >= WATCH_MIN_APS && n >= WATCH_MIN_APS &&
+         apOverlapCount(aps, n, g.watchRef, g.watchCount, WATCH_APS) == 0;
+}
+
+// Empty is valid (no key). Google keys use letters, digits, '-' and '_'.
+inline bool validGeoKey(const char *key) {
+  size_t len = 0;
+  for (; key[len]; len++) {
+    char c = key[len];
+    bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_';
+    if (!ok || len >= GEO_KEY_MAX) {
+      return false;
+    }
+  }
+  return true;
+}
+
+inline bool buildGeoUrl(const char *key, char *out, size_t cap) {
+  if (!key[0] || !validGeoKey(key)) {
+    return false;
+  }
+  TextWriter w(out, cap);
+  w.putStr(GEO_URL_PREFIX);
+  w.putStr(key);
+  return w.result() > 0;
+}
+
+inline size_t buildGeoRequest(char *out, size_t cap, const ApInfo *aps, uint8_t n) {
+  TextWriter w(out, cap);
+  w.putStr("{\"considerIp\":false,\"wifiAccessPoints\":[");
+  for (uint8_t k = 0; k < n; k++) {
+    const uint8_t *b = aps[k].bssid;
+    w.putf("%s{\"macAddress\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"signalStrength\":%d,\"channel\":%u}", k ? "," : "",
+           b[0], b[1], b[2], b[3], b[4], b[5], static_cast<int>(aps[k].rssi), static_cast<unsigned>(aps[k].channel));
+  }
+  w.putStr("]}");
+  return w.result();
+}
+
+inline bool jsonReadNumber(const char *p, double &out) {
+  if (!p) {
+    return false;
+  }
+  if (*p == '"') {
+    p++;  // some firmwares quote numbers
+  }
+  char *end = nullptr;
+  double v = strtod(p, &end);
+  if (end == p || !std::isfinite(v)) {
+    return false;
+  }
+  out = v;
+  return true;
+}
+
+inline bool jsonStringIs(const char *p, const char *value) {
+  if (!p || *p != '"') {
+    return false;
+  }
+  size_t n = strlen(value);
+  return strncmp(p + 1, value, n) == 0 && p[1 + n] == '"';
+}
+
+// Points just past the '}' that closes the object starting at p, or nullptr.
+inline const char *jsonObjectEnd(const char *p) {
+  if (!p || *p != '{') {
+    return nullptr;
+  }
+  int depth = 0;
+  bool inString = false;
+  for (; *p; ++p) {
+    if (inString) {
+      if (*p == '\\' && p[1]) {
+        ++p;
+      } else if (*p == '"') {
+        inString = false;
+      }
+    } else if (*p == '"') {
+      inString = true;
+    } else if (*p == '{') {
+      depth++;
+    } else if (*p == '}') {
+      if (--depth == 0) {
+        return p + 1;
+      }
+    }
+  }
+  return nullptr;
+}
+
+// Value of key inside the object [obj, end), or nullptr.
+inline const char *jsonValueIn(const char *obj, const char *end, const char *key) {
+  const char *v = jsonValueAfterKey(obj, key);
+  return (v && v < end) ? v : nullptr;
+}
+
+enum class GeoOutcome : uint8_t { Fix, NotFound, Quota, Error, Retry };
+
+inline GeoOutcome parseGeoResponse(int code, const char *body, double &lat, double &lon, double &acc) {
+  if (code <= 0 || code >= 500) {
+    return GeoOutcome::Retry;
+  }
+  if (code == 200) {
+    const char *loc = jsonValueAfterKey(body, "location");
+    const char *locEnd = jsonObjectEnd(loc);
+    if (locEnd && jsonReadNumber(jsonValueIn(loc, locEnd, "lat"), lat) &&
+        jsonReadNumber(jsonValueIn(loc, locEnd, "lng"), lon) && jsonReadNumber(jsonValueAfterKey(body, "accuracy"), acc) &&
+        lat >= -90.0 && lat <= 90.0 && lon >= -180.0 && lon <= 180.0 && acc >= 0.0) {
+      return GeoOutcome::Fix;
+    }
+    return GeoOutcome::Error;
+  }
+  const char *reason = jsonValueAfterKey(body, "reason");
+  if (code == 429 || jsonStringIs(reason, "dailyLimitExceeded") || jsonStringIs(reason, "userRateLimitExceeded") ||
+      jsonStringIs(reason, "rateLimitExceeded")) {
+    return GeoOutcome::Quota;
+  }
+  if (code == 404 || jsonStringIs(reason, "notFound")) {
+    return GeoOutcome::NotFound;
+  }
+  return GeoOutcome::Error;
+}
+
+// ---------------------------------------------------------------- Deco 4G signal
+
+constexpr size_t DECO_PASS_MAX = 64;
+
+struct DecoSignal {
+  bool valid = false;
+  char net[16] = {};
+  float rsrp = NAN;
+  float rsrq = NAN;
+  float snr = NAN;
+  float lvl = NAN;
+};
+
+// Empty is valid (feature off). Printable ASCII only.
+inline bool validDecoPassword(const char *pass) {
+  size_t len = 0;
+  for (; pass[len]; len++) {
+    unsigned char c = static_cast<unsigned char>(pass[len]);
+    if (c < 0x20 || c >= 0x7f || len >= DECO_PASS_MAX) {
+      return false;
+    }
+  }
+  return true;
+}
+
+inline float jsonNumberOrNan(const char *p) {
+  double v = 0;
+  return jsonReadNumber(p, v) ? static_cast<float>(v) : NAN;
+}
+
+// Decrypted reply of admin/network?form=internet:
+// {"error_code":0,"result":{"mobile_cpe":{"network_type":"lte","rsrp":-95,...}}}
+inline bool parseDecoSignal(const char *json, DecoSignal &sig) {
+  sig = DecoSignal();
+  double code = -1;
+  if (!jsonReadNumber(jsonValueAfterKey(json, "error_code"), code) || code != 0) {
+    return false;
+  }
+  const char *cpe = jsonValueAfterKey(json, "mobile_cpe");
+  const char *end = jsonObjectEnd(cpe);
+  if (!end) {
+    return false;
+  }
+  const char *net = jsonValueIn(cpe, end, "network_type");
+  if (net && *net == '"') {
+    size_t i = 0;
+    for (const char *p = net + 1; *p && *p != '"' && i + 1 < sizeof(sig.net); ++p) {
+      char c = *p;
+      bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-';
+      if (ok) {
+        sig.net[i++] = c;
+      }
+    }
+    sig.net[i] = '\0';
+  }
+  sig.rsrp = jsonNumberOrNan(jsonValueIn(cpe, end, "rsrp"));
+  sig.rsrq = jsonNumberOrNan(jsonValueIn(cpe, end, "rsrq"));
+  sig.snr = jsonNumberOrNan(jsonValueIn(cpe, end, "snr"));
+  sig.lvl = jsonNumberOrNan(jsonValueIn(cpe, end, "signal_strength"));
+  sig.valid = sig.net[0] || std::isfinite(sig.rsrp) || std::isfinite(sig.lvl);
+  return sig.valid;
+}
+
+// Deco request signature text; is the plaintext RSA-encrypted in 53-byte pieces.
+inline size_t buildDecoSignText(char *out, size_t cap, bool login, const char *aesKey, const char *aesIv,
+                                const char *md5Hex, uint32_t seq, size_t dataLen) {
+  TextWriter w(out, cap);
+  if (login) {
+    w.putf("k=%s&i=%s&", aesKey, aesIv);
+  }
+  w.putf("h=%s&s=%lu", md5Hex, static_cast<unsigned long>(seq + dataLen));
+  return w.result();
+}
+
+// application/x-www-form-urlencoded value (base64 needs + / = escaped).
+inline size_t urlEncode(char *out, size_t cap, const char *in) {
+  TextWriter w(out, cap);
+  for (; *in && !w.overflow; ++in) {
+    unsigned char c = static_cast<unsigned char>(*in);
+    bool plain = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+                 c == '.' || c == '~';
+    if (plain) {
+      w.putChar(static_cast<char>(c));
+    } else {
+      w.putf("%%%02X", c);
+    }
+  }
+  return w.result();
+}
+
+// ---------------------------------------------------------------- park message
+
+struct ParkResult {
+  uint32_t t = 0;
+  uint32_t runS = 0;
+  ParkSrc src = ParkSrc::None;
+  float lat = NAN;
+  float lon = NAN;
+  uint32_t acc = 0;
+  uint8_t aps = 0;
+  DecoSignal sig;
+};
+
+inline bool parkHasPosition(const ParkResult &r) {
+  return (r.src == ParkSrc::Google || r.src == ParkSrc::Same) && std::isfinite(r.lat) && std::isfinite(r.lon);
+}
+
+// The park message body is this JSON; netlink builds the ntfy text from it.
+inline size_t buildParkData(char *out, size_t cap, const ParkResult &r) {
+  TextWriter w(out, cap);
+  w.putf("{\"v\":1,\"t\":%lu,\"run\":%lu,\"src\":\"%s\"", static_cast<unsigned long>(r.t),
+         static_cast<unsigned long>(r.runS), parkSrcName(r.src));
+  if (parkHasPosition(r)) {
+    w.putf(",\"lat\":%.5f,\"lon\":%.5f,\"acc\":%lu", static_cast<double>(r.lat), static_cast<double>(r.lon),
+           static_cast<unsigned long>(r.acc));
+  }
+  w.putf(",\"aps\":%u", static_cast<unsigned>(r.aps));
+  if (r.sig.valid) {
+    w.putStr(",\"sig\":{");
+    bool first = true;
+    if (r.sig.net[0]) {
+      w.putStr("\"net\":\"");
+      w.putEscaped(r.sig.net);
+      w.putChar('"');
+      first = false;
+    }
+    const char *keys[] = {"rsrp", "rsrq", "snr", "lvl"};
+    const float vals[] = {r.sig.rsrp, r.sig.rsrq, r.sig.snr, r.sig.lvl};
+    for (int k = 0; k < 4; k++) {
+      if (std::isfinite(vals[k])) {
+        w.putf("%s\"%s\":", first ? "" : ",", keys[k]);
+        if (k == 2) {
+          w.putf("%.1f", static_cast<double>(roundTo(vals[k], 10.0f)));
+        } else {
+          w.putf("%.0f", static_cast<double>(roundTo(vals[k], 1.0f)));
+        }
+        first = false;
+      }
+    }
+    w.putChar('}');
+  }
+  w.putChar('}');
+  return w.result();
+}
+
+// Human text for ntfy and the generic "message", from the park data JSON.
+// click gets a Google Maps link when there is a position.
+inline size_t buildParkText(char *out, size_t cap, const char *data, char *click, size_t clickCap) {
+  if (click && clickCap) {
+    click[0] = '\0';
+  }
+  double run = 0, lat = 0, lon = 0, acc = 0;
+  jsonReadNumber(jsonValueAfterKey(data, "run"), run);
+  bool pos = jsonReadNumber(jsonValueAfterKey(data, "lat"), lat) && jsonReadNumber(jsonValueAfterKey(data, "lon"), lon) &&
+             jsonReadNumber(jsonValueAfterKey(data, "acc"), acc);
+  TextWriter w(out, cap);
+  if (pos) {
+    w.putf("%.5f, %.5f \xC2\xB1%.0f m", lat, lon, acc);
+    if (click && clickCap) {
+      snprintf(click, clickCap, "https://maps.google.com/?q=%.5f,%.5f", lat, lon);
+    }
+  } else {
+    w.putStr("Position unknown (");
+    const char *src = jsonValueAfterKey(data, "src");
+    if (src && *src == '"') {
+      for (const char *p = src + 1; *p && *p != '"'; ++p) {
+        w.putChar(*p);
+      }
+    }
+    w.putChar(')');
+  }
+  if (run > 0) {
+    w.putStr(" \xC2\xB7 drove ");
+    putDuration(w, static_cast<uint32_t>(run));
+  }
+  const char *sig = jsonValueAfterKey(data, "sig");
+  const char *sigEnd = jsonObjectEnd(sig);
+  if (sigEnd) {
+    double v = 0;
+    if (jsonReadNumber(jsonValueIn(sig, sigEnd, "rsrp"), v)) {
+      w.putf(" \xC2\xB7 4G %.0f dBm", v);
+    } else if (jsonReadNumber(jsonValueIn(sig, sigEnd, "lvl"), v)) {
+      w.putf(" \xC2\xB7 4G %.0f%%", v);
+    }
+  }
+  return w.result();
 }
 
 }  // namespace cs

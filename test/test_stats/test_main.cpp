@@ -31,6 +31,20 @@ static void test_settings_sanitisers() {
   TEST_ASSERT_EQUAL_UINT8(15, cs::sanitiseBatchMin(15));
   TEST_ASSERT_EQUAL_UINT8(60, cs::sanitiseBatchMin(60));
   TEST_ASSERT_EQUAL_UINT8(30, cs::sanitiseBatchMin(20));
+  TEST_ASSERT_EQUAL_UINT8(0, cs::sanitiseBatchMin(0));
+  TEST_ASSERT_EQUAL_UINT8(120, cs::sanitiseBatchMin(120));
+  TEST_ASSERT_EQUAL_UINT8(240, cs::sanitiseBatchMin(240));
+  TEST_ASSERT_EQUAL_UINT8(30, cs::sanitiseBatchMin(45));
+  TEST_ASSERT_EQUAL_UINT8(30, cs::sanitiseBatchMin(255));
+  uint8_t v = 15;
+  const char *texts[] = {"30m", "1h", "2h", "4h", "-", "15m"};
+  for (const char *expected : texts) {
+    v = cs::nextBatchMin(v);
+    char text[8];
+    cs::batchMinText(v, text, sizeof text);
+    TEST_ASSERT_EQUAL_STRING(expected, text);
+  }
+  TEST_ASSERT_EQUAL_UINT8(60, cs::nextBatchMin(99));  // invalid counts as the default 30
   TEST_ASSERT_EQUAL_UINT8(1, cs::sanitiseDaysAvg(0));
   TEST_ASSERT_EQUAL_UINT8(7, cs::sanitiseDaysAvg(9));
   cs::OnlineSettings defaults;

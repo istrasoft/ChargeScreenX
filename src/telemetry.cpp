@@ -11,6 +11,7 @@ namespace {
 constexpr const char *CACHE_PATH = "/tx_cache.bin";
 constexpr const char *OUTBOX_PATH = "/outbox.bin";
 constexpr const char *DAYS_PATH = "/days.bin";
+constexpr const char *GEO_PATH = "/lastfix.bin";
 constexpr uint8_t STORE_VERSION = 1;
 
 struct CacheHeader {
@@ -381,6 +382,33 @@ bool storeSaveDays(const cs::DayHistory &days) {
   return ok;
 }
 
+bool storeLoadGeo(cs::GeoState &geo) {
+  if (!storeReady) {
+    return false;
+  }
+  StoreLock lock;
+  if (fileSize(GEO_PATH) != sizeof(cs::GeoState) || !readAt(GEO_PATH, 0, &geo, sizeof(geo)) ||
+      !cs::geoStateValid(geo)) {
+    geo = cs::GeoState();
+    return false;
+  }
+  return true;
+}
+
+bool storeSaveGeo(const cs::GeoState &geo) {
+  if (!storeReady) {
+    return false;
+  }
+  StoreLock lock;
+  File f = LittleFS.open(GEO_PATH, "w");
+  if (!f) {
+    return false;
+  }
+  bool ok = f.write(reinterpret_cast<const uint8_t *>(&geo), sizeof(geo)) == sizeof(geo);
+  f.close();
+  return ok;
+}
+
 // ---------------------------------------------------------------- sampling and triggers (loop() only)
 
 namespace {
@@ -397,6 +425,37 @@ bool recordOpen = false;
 uint32_t recordStartMs = 0;
 uint32_t lastSampleMs = 0;
 uint8_t samplesThisMinute = 0;
+cs::EngineTracker engineTracker;
+cs::StarterWatch starterWatch;
+
+void queueMessage(const cs::Message &msg);
+
+// Engine and starter battery, every sample while active.
+void checkVehicle(const cs::Sample &sample, const cs::ClockNow &clock, uint32_t unixOr0, uint32_t nowMs) {
+  bool running = sample.orionValid && cs::orionEngineRunning(sample.orionState);
+  if (running) {
+    netlinkEngineRunning();
+  }
+  cs::ParkTrigger park = cs::engineUpdate(engineTracker, sample.orionValid, running, nowMs);
+  if (park.fired) {
+    cs::ParkRequest req;
+    req.offMs = park.offMs;
+    req.offUnix = clock.utcValid ? clock.unixUtc - (nowMs - park.offMs) / 1000U : 0;
+    req.runS = park.runS;
+    req.boot = storeBootId();
+    Serial.printf("Online: parked after %lu s of driving\n", static_cast<unsigned long>(park.runS));
+    netlinkRequestPark(req);
+  }
+  cs::StarterAlert starter =
+      cs::starterUpdate(starterWatch, sample.orionValid, sample.orionState, sample.orionInV, nowMs);
+  if (starter.fired) {
+    cs::Message msg;
+    cs::messageInit(msg, cs::MsgKind::Starter, storeBootId(), unixOr0, nowMs);
+    if (cs::buildStarterBody(msg.body, sizeof(msg.body), starter) > 0) {
+      queueMessage(msg);
+    }
+  }
+}
 
 void queueMessage(const cs::Message &msg) {
   if (storeEnqueueMessage(msg)) {
@@ -505,6 +564,8 @@ void telemetryLoop(const cs::Sample &sample, bool demoMode, bool hasSolarKey, bo
     wasActive = false;
     recordOpen = false;
     samplesThisMinute = 0;
+    engineTracker = cs::EngineTracker();
+    starterWatch = cs::StarterWatch();
     return;
   }
   if (!wasActive) {
@@ -524,6 +585,7 @@ void telemetryLoop(const cs::Sample &sample, bool demoMode, bool hasSolarKey, bo
   if (sample.shuntValid) {
     cs::drainAddSample(drainMonitor, sample.currentA);
   }
+  checkVehicle(sample, clock, unixOr0, nowMs);
 
   int32_t today = cs::NO_DAY;
   uint16_t minute = 0;

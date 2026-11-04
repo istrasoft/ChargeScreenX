@@ -10,7 +10,9 @@ struct NetConfig {
   char url[192];
   char token[cs::POST_TOKEN_MAX + 1];  // Bearer token for url, empty = none
   char tz[64];  // POSIX TZ override, empty = automatic offset lookup
-  uint8_t batchMin;
+  char geoKey[cs::GEO_KEY_MAX + 1];      // Google geolocation key, empty = no position lookups
+  char decoPass[cs::DECO_PASS_MAX + 1];  // Deco owner password, empty = no 4G signal
+  uint8_t batchMin;                      // 0 = no periodic batches
   bool enabled;
 };
 
@@ -32,6 +34,11 @@ bool netlinkPause();
 void netlinkResume();
 void netlinkSetSuppressed(bool suppressed);
 OnlineStatus netlinkStatus();
+// A drive ended: look up the position at the next attempt (wakes the task).
+// A newer request replaces a pending one. Called from loop().
+void netlinkRequestPark(const cs::ParkRequest &req);
+// The engine is running: stops the moved-van watch. Called from loop().
+void netlinkEngineRunning();
 
 // UTC from the system clock, plus the local offset (lookup or TZ override).
 cs::ClockNow clockNow();

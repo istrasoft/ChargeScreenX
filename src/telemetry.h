@@ -21,6 +21,9 @@ uint8_t storeMessageCount();
 uint32_t storeUnsentRecordCount();
 bool storeLoadDays(cs::DayHistory &days);
 bool storeSaveDays(const cs::DayHistory &days);
+// /lastfix.bin: last Google fix, daily call budget, moved-van watch reference.
+bool storeLoadGeo(cs::GeoState &geo);
+bool storeSaveGeo(const cs::GeoState &geo);
 
 // Sampling and triggers. Called from loop() only.
 void telemetryBegin(Preferences &prefs);

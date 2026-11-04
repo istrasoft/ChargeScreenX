@@ -7,6 +7,7 @@
 #include <esp_sntp.h>
 #include <time.h>
 
+#include "deco.h"
 #include "telemetry.h"
 
 namespace {
@@ -22,8 +23,13 @@ constexpr uint32_t OFFSET_REFRESH_S = 86400;
 // Worst case for one bounded request: 15 s join + 10 s TLS handshake + 10 s HTTP.
 constexpr uint32_t PAUSE_WAIT_MS = 45000;
 constexpr uint32_t MIN_LOOP_MS = 1000;
+constexpr uint32_t OFF_RECHECK_MS = 60000;         // Send = Off: recheck the setting this often
+constexpr uint32_t WATCH_INTERVAL_MS = 60UL * 60000UL;
+constexpr uint32_t WATCH_CONFIRM_MS = 5UL * 60000UL;
+constexpr uint32_t SCAN_MS_PER_CHANNEL = 300;
 
 enum class Attempt : uint8_t { Done, Failed, RateLimited, Paused, Off };
+enum class ParkStep : uint8_t { Nothing, Queued, Retry };
 
 TaskHandle_t netTask = nullptr;
 portMUX_TYPE configMux = portMUX_INITIALIZER_UNLOCKED;
@@ -51,6 +57,67 @@ char envelopeBuffer[cs::ENVELOPE_MAX];
 char responseBuffer[2048];
 cs::Record batchRecords[cs::RECORDS_PER_BATCH];
 cs::Message messageBuffer;
+cs::ApInfo scanAps[cs::GEO_SCAN_MAX];
+cs::GeoState geoState;
+char geoUrl[160];
+bool watchActive = false;
+uint32_t nextWatchMs = 0;
+uint8_t watchSuspicions = 0;
+
+// Park request from loop(), guarded by configMux.
+cs::ParkRequest pendingPark;
+bool parkPending = false;
+uint32_t parkSeq = 0;
+volatile bool engineRanFlag = false;
+
+void setPendingPark(const cs::ParkRequest &req) {
+  taskENTER_CRITICAL(&configMux);
+  pendingPark = req;
+  parkPending = true;
+  parkSeq++;
+  taskEXIT_CRITICAL(&configMux);
+}
+
+bool takePark(cs::ParkRequest &req, uint32_t &seq) {
+  taskENTER_CRITICAL(&configMux);
+  bool have = parkPending;
+  req = pendingPark;
+  seq = parkSeq;
+  taskEXIT_CRITICAL(&configMux);
+  return have;
+}
+
+// Done: clear it, unless a newer request replaced it meanwhile.
+void finishPark(uint32_t seq, bool done, uint8_t attempts) {
+  taskENTER_CRITICAL(&configMux);
+  if (parkSeq == seq) {
+    if (done) {
+      parkPending = false;
+    } else {
+      pendingPark.attempts = attempts;
+    }
+  }
+  taskEXIT_CRITICAL(&configMux);
+}
+
+bool parkIsPending() {
+  taskENTER_CRITICAL(&configMux);
+  bool have = parkPending;
+  taskEXIT_CRITICAL(&configMux);
+  return have;
+}
+
+uint8_t configuredBatchMin() {
+  taskENTER_CRITICAL(&configMux);
+  uint8_t v = sharedConfig.batchMin;
+  taskEXIT_CRITICAL(&configMux);
+  return cs::sanitiseBatchMin(v);
+}
+
+uint32_t untilMs(uint32_t target, uint32_t now) {
+  int32_t diff = static_cast<int32_t>(target - now);
+  return diff > 0 ? static_cast<uint32_t>(diff) : 0;
+}
 
 void applyTimeZone(const char *tz) {
   setenv("TZ", tz[0] ? tz : "UTC0", 1);
@@ -226,6 +293,202 @@ void addDelayedSuffix(cs::Message &msg) {
   cs::insertAfterFirstLine(msg.body, sizeof(msg.body), suffix);
 }
 
+// STA scan without joining. Keeps the usable access points, strongest first.
+uint8_t scanAccessPoints() {
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_STA);
+  int16_t found = WiFi.scanNetworks(false, false, false, SCAN_MS_PER_CHANNEL);
+  uint8_t n = 0;
+  for (int16_t i = 0; i < found && n < cs::GEO_SCAN_MAX; i++) {
+    const uint8_t *bssid = WiFi.BSSID(i);
+    if (!bssid) {
+      continue;
+    }
+    String ssid = WiFi.SSID(i);
+    if (!cs::apUsable(ssid.c_str(), bssid, activeConfig.ssid[0], activeConfig.ssid[1])) {
+      continue;
+    }
+    memcpy(scanAps[n].bssid, bssid, 6);
+    int32_t rssi = WiFi.RSSI(i);
+    scanAps[n].rssi = static_cast<int8_t>(rssi < -127 ? -127 : (rssi > 0 ? 0 : rssi));
+    scanAps[n].channel = static_cast<uint8_t>(WiFi.channel(i));
+    n++;
+  }
+  WiFi.scanDelete();
+  uint8_t kept = cs::apKeepStrongest(scanAps, n, cs::GEO_KEEP_APS);
+  Serial.printf("Online: scan found %d networks, %u usable\n", static_cast<int>(found), kept);
+  return kept;
+}
+
+int32_t budgetDay(const cs::ClockNow &clock) {
+  return clock.localValid ? cs::localDayNumber(clock.unixUtc, clock.offsetS)
+                          : static_cast<int32_t>(clock.unixUtc / 86400U);
+}
+
+// After joining: position (Google or saved), Deco signal, then the park message.
+ParkStep handlePark(uint8_t apCount) {
+  cs::ParkRequest req;
+  uint32_t seq = 0;
+  if (!takePark(req, seq)) {
+    return ParkStep::Nothing;
+  }
+  cs::ClockNow clock = clockNow();
+  if (!storeLoadGeo(geoState)) {
+    geoState = cs::GeoState();
+  }
+  cs::ParkResult r;
+  r.runS = req.runS;
+  r.aps = apCount;
+  r.t = req.offUnix;
+  if (r.t == 0 && req.boot == storeBootId() && clock.utcValid) {
+    r.t = clock.unixUtc - (millis() - req.offMs) / 1000U;
+  }
+
+  cs::ParkSrc skipSrc = cs::ParkSrc::None;
+  cs::GeoStep step = cs::geoDecide(geoState, scanAps, apCount, activeConfig.geoKey[0] != '\0', budgetDay(clock), skipSrc);
+  if (step == cs::GeoStep::Saved) {
+    r.src = cs::ParkSrc::Same;
+    r.lat = geoState.lat;
+    r.lon = geoState.lon;
+    r.acc = geoState.acc;
+  } else if (step == cs::GeoStep::Skip) {
+    r.src = skipSrc;
+  } else if (!cs::buildGeoUrl(activeConfig.geoKey, geoUrl, sizeof(geoUrl)) ||
+             cs::buildGeoRequest(bodyBuffer, sizeof(bodyBuffer), scanAps, apCount) == 0) {
+    r.src = cs::ParkSrc::Error;
+  } else {
+    geoState.calls++;
+    storeSaveGeo(geoState);
+    int code = httpRequest(geoUrl, bodyBuffer, responseBuffer, sizeof(responseBuffer));
+    logHeap("geolocate", code);
+    double lat = 0;
+    double lon = 0;
+    double acc = 0;
+    switch (cs::parseGeoResponse(code, responseBuffer, lat, lon, acc)) {
+      case cs::GeoOutcome::Fix:
+        cs::geoRemember(geoState, scanAps, apCount, lat, lon, acc, clock.utcValid ? clock.unixUtc : 0);
+        r.src = cs::ParkSrc::Google;
+        r.lat = geoState.lat;
+        r.lon = geoState.lon;
+        r.acc = geoState.acc;
+        break;
+      case cs::GeoOutcome::NotFound:
+        r.src = cs::ParkSrc::None;
+        break;
+      case cs::GeoOutcome::Quota:
+        geoState.refused = 1;
+        r.src = cs::ParkSrc::Quota;
+        break;
+      case cs::GeoOutcome::Retry:
+        if (req.attempts + 1 < cs::PARK_MAX_ATTEMPTS) {
+          finishPark(seq, false, static_cast<uint8_t>(req.attempts + 1));
+          Serial.println("Online: geolocation failed, will retry");
+          return ParkStep::Retry;
+        }
+        r.src = cs::ParkSrc::Error;
+        break;
+      default:
+        Serial.printf("Online: geolocation error: %.120s\n", responseBuffer);
+        r.src = cs::ParkSrc::Error;
+        break;
+    }
+  }
+
+  if (activeConfig.decoPass[0] && !paused) {
+    String gateway = WiFi.gatewayIP().toString();
+    if (decoReadSignal(gateway.c_str(), activeConfig.decoPass, r.sig)) {
+      Serial.printf("Online: Deco signal %s rsrp %.0f\n", r.sig.net, static_cast<double>(r.sig.rsrp));
+    }
+  }
+
+  engineRanFlag = false;  // left over from the drive that just ended
+  cs::watchSetReference(geoState, scanAps, apCount);
+  storeSaveGeo(geoState);
+  watchActive = geoState.watchActive != 0;
+  watchSuspicions = 0;
+  nextWatchMs = millis() + WATCH_INTERVAL_MS;
+
+  cs::Message msg;
+  cs::messageInit(msg, cs::MsgKind::Park, req.boot, r.t, req.offMs);
+  if (cs::buildParkData(msg.body, sizeof(msg.body), r) == 0 || !storeEnqueueMessage(msg)) {
+    Serial.println("Online: park message failed");
+  }
+  finishPark(seq, true, 0);
+  Serial.printf("Online: park %s, %u networks\n", cs::parkSrcName(r.src), apCount);
+  return ParkStep::Queued;
+}
+
+// The engine ran: the van is being driven, so stop watching for a move.
+void processEngineFlag() {
+  if (!engineRanFlag) {
+    return;
+  }
+  engineRanFlag = false;
+  if (!watchActive) {
+    return;
+  }
+  watchActive = false;
+  watchSuspicions = 0;
+  if (storeLoadGeo(geoState)) {
+    geoState.watchActive = 0;
+    storeSaveGeo(geoState);
+  }
+  Serial.println("Online: engine running, moved-van watch off");
+}
+
+// Hourly scan while parked. Returns true when it queued a "moved" alert and
+// a new park request (an attempt should follow now).
+bool runWatchScan() {
+  taskENTER_CRITICAL(&configMux);
+  activeConfig = sharedConfig;
+  taskEXIT_CRITICAL(&configMux);
+  nextWatchMs = millis() + WATCH_INTERVAL_MS;
+  if (paused || suppressed || !activeConfig.enabled) {
+    return false;
+  }
+  busy = true;  // set before checking paused, see netlinkPause()
+  if (paused || apActive()) {
+    busy = false;
+    return false;
+  }
+  uint8_t n = scanAccessPoints();
+  wifiOff();
+  busy = false;
+  if (!storeLoadGeo(geoState)) {
+    watchActive = false;
+    return false;
+  }
+  uint8_t overlap = cs::apOverlapCount(scanAps, n, geoState.watchRef, geoState.watchCount, cs::WATCH_APS);
+  Serial.printf("Online: watch scan, %u usable, %u known\n", n, overlap);
+  if (!cs::watchSuspicious(geoState, scanAps, n)) {
+    watchSuspicions = 0;
+    return false;
+  }
+  if (++watchSuspicions < 2) {
+    nextWatchMs = millis() + WATCH_CONFIRM_MS;
+    return false;
+  }
+  watchSuspicions = 0;
+  watchActive = false;
+  geoState.watchActive = 0;
+  storeSaveGeo(geoState);
+
+  cs::ClockNow clock = clockNow();
+  uint32_t nowUnix = clock.utcValid ? clock.unixUtc : 0;
+  cs::Message msg;
+  cs::messageInit(msg, cs::MsgKind::Moved, storeBootId(), nowUnix, millis());
+  snprintf(msg.body, sizeof(msg.body), "%s", cs::MOVED_BODY);
+  storeEnqueueMessage(msg);
+  cs::ParkRequest req;
+  req.offUnix = nowUnix;
+  req.offMs = millis();
+  req.runS = 0;
+  req.boot = storeBootId();
+  setPendingPark(req);
+  Serial.println("Online: van moved, looking up the new position");
+  return true;
+}
+
 // True when the configured URL can be posted to without joining WiFi first.
 bool urlUsable() {
   if (cs::sinkType(activeConfig.url) == cs::SinkType::Ntfy) {
@@ -263,12 +526,24 @@ Attempt sendAll() {
       return Attempt::Paused;
     }
     cs::MsgKind kind = static_cast<cs::MsgKind>(messageBuffer.kind);
-    addDelayedSuffix(messageBuffer);
     uint32_t when = messageBuffer.eventUnix ? messageBuffer.eventUnix : static_cast<uint32_t>(time(nullptr));
-    size_t len = ntfy ? cs::buildNtfyEnvelope(envelopeBuffer, sizeof(envelopeBuffer), topic, messageBuffer.title,
-                                              messageBuffer.body, messageBuffer.priority, cs::kindTag(kind))
-                      : cs::buildGenericEnvelope(envelopeBuffer, sizeof(envelopeBuffer), kind, messageBuffer.title,
-                                                 messageBuffer.body, messageBuffer.priority, when, nullptr);
+    size_t len;
+    if (kind == cs::MsgKind::Park) {
+      // The body is the data JSON; the human text is built from it.
+      char text[128];
+      char click[96];
+      cs::buildParkText(text, sizeof(text), messageBuffer.body, click, sizeof(click));
+      len = ntfy ? cs::buildNtfyEnvelope(envelopeBuffer, sizeof(envelopeBuffer), topic, messageBuffer.title, text,
+                                         messageBuffer.priority, cs::kindTag(kind), click)
+                 : cs::buildGenericEnvelope(envelopeBuffer, sizeof(envelopeBuffer), kind, messageBuffer.title, text,
+                                            messageBuffer.priority, when, messageBuffer.body);
+    } else {
+      addDelayedSuffix(messageBuffer);
+      len = ntfy ? cs::buildNtfyEnvelope(envelopeBuffer, sizeof(envelopeBuffer), topic, messageBuffer.title,
+                                         messageBuffer.body, messageBuffer.priority, cs::kindTag(kind))
+                 : cs::buildGenericEnvelope(envelopeBuffer, sizeof(envelopeBuffer), kind, messageBuffer.title,
+                                            messageBuffer.body, messageBuffer.priority, when, nullptr);
+    }
     if (len == 0) {
       storePopMessage(id);
       continue;
@@ -347,6 +622,10 @@ Attempt runAttempt() {
     return Attempt::Failed;
   }
 
+  // A parking needs the scan before joining: a connected scan would drop the link.
+  bool parkWaiting = parkIsPending();
+  uint8_t apCount = parkWaiting ? scanAccessPoints() : 0;
+
   Attempt result;
   if (!connectWifi()) {
     result = paused ? Attempt::Paused : Attempt::Failed;
@@ -359,7 +638,11 @@ Attempt runAttempt() {
     if (!paused) {
       refreshOffset();
     }
+    ParkStep park = (paused || !parkWaiting) ? ParkStep::Nothing : handlePark(apCount);
     result = paused ? Attempt::Paused : sendAll();
+    if (result == Attempt::Done && park == ParkStep::Retry) {
+      result = Attempt::Failed;  // back off, then retry the position lookup
+    }
     if (result != Attempt::Paused) {
       onlineState = static_cast<uint8_t>(result == Attempt::Done ? cs::OnlineState::Sent : cs::OnlineState::Error);
       stampAttempt();
@@ -371,21 +654,44 @@ Attempt runAttempt() {
 }
 
 void netTaskMain(void *) {
-  uint32_t nextPeriodicMs = millis() + FIRST_ATTEMPT_DELAY_MS;
+  uint32_t lastAttemptMs = millis();
+  bool firstDone = false;
   bool urgent = false;
+  if (storeLoadGeo(geoState) && geoState.watchActive) {
+    watchActive = true;  // still parked since before the reboot
+    nextWatchMs = millis() + WATCH_INTERVAL_MS;
+  }
   for (;;) {
     uint32_t now = millis();
+    processEngineFlag();
     if (backoffActive && static_cast<int32_t>(backoffUntilMs - now) <= 0) {
       backoffActive = false;  // expired; a stale deadline would compare wrongly after ~24.8 days
     }
+    if (watchActive && untilMs(nextWatchMs, now) == 0) {
+      if (runWatchScan()) {
+        urgent = true;
+      }
+      continue;
+    }
+    // Read every wake, so a change on the settings screen applies at once.
+    uint8_t batchMin = configuredBatchMin();
     uint32_t waitMs;
     if (backoffActive) {
       waitMs = backoffUntilMs - now;
     } else if (urgent) {
       waitMs = 0;
+    } else if (!firstDone) {
+      waitMs = untilMs(lastAttemptMs + FIRST_ATTEMPT_DELAY_MS, now);  // clock and time zone after boot
+    } else if (batchMin == 0) {
+      waitMs = OFF_RECHECK_MS;  // Send = Off: only "send now" starts an attempt
     } else {
-      int32_t untilPeriodic = static_cast<int32_t>(nextPeriodicMs - now);
-      waitMs = untilPeriodic > 0 ? static_cast<uint32_t>(untilPeriodic) : 0;
+      waitMs = untilMs(lastAttemptMs + static_cast<uint32_t>(batchMin) * 60000UL, now);
+    }
+    if (watchActive && waitMs > 0) {
+      uint32_t untilWatch = untilMs(nextWatchMs, now);
+      if (untilWatch < waitMs) {
+        waitMs = untilWatch > 0 ? untilWatch : 1;
+      }
     }
     if (waitMs > 0) {
       if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(waitMs)) > 0) {
@@ -399,8 +705,8 @@ void netTaskMain(void *) {
     taskENTER_CRITICAL(&configMux);
     activeConfig = sharedConfig;
     taskEXIT_CRITICAL(&configMux);
-    // 0 (unconfigured) or any invalid value becomes 30 minutes.
-    nextPeriodicMs = millis() + static_cast<uint32_t>(cs::sanitiseBatchMin(activeConfig.batchMin)) * 60000UL;
+    lastAttemptMs = millis();
+    firstDone = true;
 
     Attempt result = runAttempt();
     if (result == Attempt::Done) {
@@ -491,6 +797,15 @@ void netlinkResume() {
 
 void netlinkSetSuppressed(bool value) {
   suppressed = value;
+}
+
+void netlinkRequestPark(const cs::ParkRequest &req) {
+  setPendingPark(req);
+  netlinkNotify();
+}
+
+void netlinkEngineRunning() {
+  engineRanFlag = true;
 }
 
 OnlineStatus netlinkStatus() {

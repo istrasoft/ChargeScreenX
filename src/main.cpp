@@ -106,9 +106,10 @@ static constexpr int16_t SETTINGS_ROTATION_Y = 168;
 static constexpr int16_t SETTINGS_TIMEOUT_Y = 76;
 static constexpr int16_t SETTINGS_BATTERY_Y = 116;
 static constexpr int16_t SETTINGS_DIMMING_Y = 156;
-static constexpr int16_t SETTINGS_LABELS_Y = 76;
-static constexpr int16_t SETTINGS_GRID_Y = 116;
-static constexpr int16_t SETTINGS_CYCLE_Y = 156;
+static constexpr int16_t SETTINGS_LABELS_Y = 66;
+static constexpr int16_t SETTINGS_GRID_Y = 100;
+static constexpr int16_t SETTINGS_CYCLE_Y = 134;
+static constexpr int16_t SETTINGS_SEND_Y = 168;
 static constexpr int16_t ROTATE_BUTTON_X = 70;
 static constexpr int16_t ROTATE_BUTTON_Y = 68;
 static constexpr int16_t ROTATE_BUTTON_W = 100;
@@ -275,6 +276,8 @@ static String onlineWifiSsid[2];
 static String onlineWifiPass[2];
 static String onlinePostUrl;
 static String onlinePostToken;
+static String onlineGeoKey;
+static String onlineDecoPass;
 static String onlineTzOverride;
 static cs::OnlineSettings onlineSettings;
 static String settingsMessage;
@@ -601,6 +604,12 @@ static String cycleText() {
   return cycleSeconds ? String(cycleSeconds) + "s" : String("-");
 }
 
+static String sendText() {
+  char text[8];
+  cs::batchMinText(onlineSettings.batchMin, text, sizeof(text));
+  return text;
+}
+
 static cs::PageAvailability pageAvailability() {
   return cs::PageAvailability{demoModeEnabled, storedSolarKey.length() > 0, storedOrionKey.length() > 0};
 }
@@ -618,6 +627,8 @@ static void applyOnlineConfig() {
   snprintf(config.url, sizeof(config.url), "%s", onlinePostUrl.c_str());
   snprintf(config.token, sizeof(config.token), "%s", onlinePostToken.c_str());
   snprintf(config.tz, sizeof(config.tz), "%s", onlineTzOverride.c_str());
+  snprintf(config.geoKey, sizeof(config.geoKey), "%s", onlineGeoKey.c_str());
+  snprintf(config.decoPass, sizeof(config.decoPass), "%s", onlineDecoPass.c_str());
   config.batchMin = onlineSettings.batchMin;
   config.enabled = onlineEnabled();
   netlinkConfigure(config);
@@ -661,6 +672,14 @@ static void loadStoredSecrets() {
   onlinePostToken = secrets.getString("post_token", "");
   if (!cs::validPostToken(onlinePostToken.c_str())) {
     onlinePostToken = "";
+  }
+  onlineGeoKey = secrets.getString("geo_key", "");
+  if (!cs::validGeoKey(onlineGeoKey.c_str())) {
+    onlineGeoKey = "";
+  }
+  onlineDecoPass = secrets.getString("deco_pass", "");
+  if (!cs::validDecoPassword(onlineDecoPass.c_str())) {
+    onlineDecoPass = "";
   }
   onlineTzOverride = secrets.getString("tz_override", "");
   onlineSettings.disAmps = cs::sanitiseDisAmps(secrets.getFloat("dis_amps", 4.0f));
@@ -2022,10 +2041,10 @@ static void appendSelect(String &html, const char *name, const char *label, cons
 static void appendOnlineSection(String &html) {
   static const uint8_t reportHours[] = {4, 5, 6, 7, 8, 9, 10, 11, 12};
   static const uint8_t eveningHours[] = {16, 17, 18, 19, 20, 21, 22};
-  static const uint8_t batchOptions[] = {15, 30, 60};
+  static const uint8_t batchOptions[] = {15, 30, 60, 120, 240, 0};
   static const uint8_t dayOptions[] = {1, 2, 3, 4, 5, 6, 7};
   html += F("<h2>Online</h2>");
-  html += F("<p class='hint'>With a URL and a WiFi network set, ChargeScreen joins WiFi only to send drain alerts, a morning battery report, an evening solar report and a silent data batch. Use an ntfy topic such as https://ntfy.sh/your_topic, or your own endpoint. A protected topic also needs an access token, sent as a Bearer header. Nothing is sent in demo mode. Status: ");
+  html += F("<p class='hint'>With a URL and a WiFi network set, ChargeScreen joins WiFi only to send drain alerts, a morning battery report, an evening solar report and a silent data batch. After a drive of 10+ minutes it reports where the van parked (needs a Google geolocation key) and the 4G signal there (needs the Deco owner password), warns when the starter battery runs low, and when the van seems to move with the engine off. Use an ntfy topic such as https://ntfy.sh/your_topic, or your own endpoint. A protected topic also needs an access token, sent as a Bearer header. Nothing is sent in demo mode. Status: ");
   html += onlineStatusLine();
   html += F("</p>");
   appendWifiFields(html, 1, onlineWifiSsid[0], onlineWifiPass[0]);
@@ -2035,6 +2054,12 @@ static void appendOnlineSection(String &html) {
   html += F("'><label for='post_token'>Access token</label><input id='post_token' name='post_token' type='password' maxlength='127' autocomplete='new-password' placeholder='");
   html += onlinePostToken.length() ? F("saved") : F("not set, e.g. tk_...");
   html += F("'><label class='check'><input type='checkbox' name='clear_token' value='1'>Remove saved token</label>");
+  html += F("<label for='geo_key'>Google geolocation key</label><input id='geo_key' name='geo_key' type='password' maxlength='64' autocomplete='new-password' placeholder='");
+  html += onlineGeoKey.length() ? F("saved") : F("not set: parking position off");
+  html += F("'><label class='check'><input type='checkbox' name='clear_geo_key' value='1'>Remove saved key</label>");
+  html += F("<label for='deco_pass'>Deco password (4G signal)</label><input id='deco_pass' name='deco_pass' type='password' maxlength='64' autocomplete='new-password' placeholder='");
+  html += onlineDecoPass.length() ? F("saved") : F("not set: no signal readings");
+  html += F("'><label class='check'><input type='checkbox' name='clear_deco_pass' value='1'>Remove saved password</label>");
   html += F("<label for='tz_override'>Time zone override</label><input id='tz_override' name='tz_override' maxlength='63' autocomplete='off' placeholder='automatic, e.g. CET-1CEST,M3.5.0,M10.5.0/3' value='");
   html += htmlAttr(onlineTzOverride);
   html += F("'><div class='grid'><label for='dis_amps'>Drain limit (A)</label><label for='dis_win_min'>Drain window (min)</label>");
@@ -2045,7 +2070,17 @@ static void appendOnlineSection(String &html) {
   html += F("'></div>");
   appendSelect(html, "report_hour", "Morning report hour", reportHours, sizeof(reportHours), onlineSettings.reportHour, ":00");
   appendSelect(html, "evening_hour", "Evening report hour", eveningHours, sizeof(eveningHours), onlineSettings.eveningHour, ":00");
-  appendSelect(html, "batch_min", "Batch interval", batchOptions, sizeof(batchOptions), onlineSettings.batchMin, " min");
+  html += F("<label for='batch_min'>Batch interval</label><select id='batch_min' name='batch_min'>");
+  for (uint8_t value : batchOptions) {
+    html += F("<option value='");
+    html += value;
+    html += F("'");
+    html += value == onlineSettings.batchMin ? F(" selected") : F("");
+    html += F(">");
+    html += value ? String(value) + " min" : String("Off");
+    html += F("</option>");
+  }
+  html += F("</select>");
   appendSelect(html, "days_avg", "Days to average", dayOptions, sizeof(dayOptions), onlineSettings.daysAvg, "");
 }
 
@@ -2367,6 +2402,30 @@ static bool saveOnlineSettings() {
     secrets.remove("post_token");
   }
 
+  // Blank keeps the saved key or password; the box removes it.
+  String geoKey = settingsServer.arg("geo_key");
+  geoKey.trim();
+  if (!cs::validGeoKey(geoKey.c_str())) {
+    ok = false;
+  } else if (geoKey.length()) {
+    onlineGeoKey = geoKey;
+    secrets.putString("geo_key", geoKey);
+  } else if (settingsServer.hasArg("clear_geo_key")) {
+    onlineGeoKey = "";
+    secrets.remove("geo_key");
+  }
+
+  String decoPass = settingsServer.arg("deco_pass");
+  if (!cs::validDecoPassword(decoPass.c_str())) {
+    ok = false;
+  } else if (decoPass.length()) {
+    onlineDecoPass = decoPass;
+    secrets.putString("deco_pass", decoPass);
+  } else if (settingsServer.hasArg("clear_deco_pass")) {
+    onlineDecoPass = "";
+    secrets.remove("deco_pass");
+  }
+
   String tz = settingsServer.arg("tz_override");
   tz.trim();
   if (tz.length() > 63) {
@@ -2421,7 +2480,7 @@ static bool saveOnlineSettings() {
   }
 
   value = onlineSettings.batchMin;
-  if (readIntArg("batch_min", 15, 60, value) && cs::sanitiseBatchMin(value) == value) {
+  if (readIntArg("batch_min", 0, 240, value) && cs::sanitiseBatchMin(value) == value) {
     if (value != onlineSettings.batchMin) {
       onlineSettings.batchMin = static_cast<uint8_t>(value);
       secrets.putUChar("batch_min", onlineSettings.batchMin);
@@ -2882,6 +2941,7 @@ static void drawSettingsPage(bool force = false) {
     drawRow(SETTINGS_LABELS_Y, "Labels", showValueLabels ? "On" : "-", showValueLabels);
     drawRow(SETTINGS_GRID_Y, "Grid", showValueGrid ? "On" : "-", showValueGrid);
     drawRow(SETTINGS_CYCLE_Y, "Cycle", cycleText(), cycleSeconds > 0);
+    drawRow(SETTINGS_SEND_Y, "Send", sendText(), onlineSettings.batchMin > 0);
   }
 
   drawBackButton();
@@ -3548,6 +3608,16 @@ static void handleTap(int16_t x, int16_t y) {
         return;
       }
 
+      if (pointInRect(x, y, SETTINGS_ROW_X, SETTINGS_SEND_Y, SETTINGS_VALUE_X + SETTINGS_VALUE_W - SETTINGS_ROW_X, SETTINGS_ROW_H)) {
+        onlineSettings.batchMin = cs::nextBatchMin(onlineSettings.batchMin);
+        secrets.putUChar("batch_min", onlineSettings.batchMin);
+        applyOnlineConfig();
+        settingsMessage = String("Send ") + sendText();
+        settingsPageDrawn = false;
+        drawCurrentPage(true);
+        return;
+      }
+
       if (pointInRect(x, y, SETTINGS_BACK_X, SETTINGS_BACK_Y, SETTINGS_BACK_W, SETTINGS_BACK_H)) {
         closeSettingsPage();
         return;
@@ -3963,6 +4033,8 @@ static cs::Sample telemetrySample() {
   if (storedOrionKey.length() && orion.valid && static_cast<int32_t>(millis() - lastOrionDecodeMs) <= 10000) {
     sample.orionValid = true;
     sample.orionOutA = orion.outputCurrent;
+    sample.orionState = orion.deviceState;
+    sample.orionInV = orion.inputVoltage;
   }
   return sample;
 }
