@@ -70,6 +70,9 @@ bool parkPending = false;
 uint32_t parkSeq = 0;
 volatile bool engineRanFlag = false;
 volatile uint32_t lastEngineMs = 0;  // millis() of the last running sample, 0 = none this boot
+volatile bool radioWanted = false;   // netlink wants BLE scanning paused for a Wi-Fi scan
+volatile bool bleIdle = false;       // loop() has stopped BLE scanning
+constexpr uint32_t BLE_PAUSE_WAIT_MS = 1500;
 
 // Network quality (netlink task only).
 bool speedTimerSet = false;  // false: measure the download at the next parked connection
@@ -308,9 +311,20 @@ void addDelayedSuffix(cs::Message &msg) {
 
 // STA scan without joining. Keeps the usable access points, strongest first.
 uint8_t scanAccessPoints() {
+  // Pause BLE scanning (owned by loop()) so the Wi-Fi scan gets the radio.
+  radioWanted = true;
+  uint32_t waitStart = millis();
+  while (!bleIdle && millis() - waitStart < BLE_PAUSE_WAIT_MS) {
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+  bool blePaused = bleIdle;
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
   int16_t found = WiFi.scanNetworks(false, false, false, SCAN_MS_PER_CHANNEL);
+  radioWanted = false;
+  if (!blePaused) {
+    Serial.println("Online: BLE scan not paused for the Wi-Fi scan");
+  }
   uint8_t n = 0;
   for (int16_t i = 0; i < found && n < cs::GEO_SCAN_MAX; i++) {
     const uint8_t *bssid = WiFi.BSSID(i);
@@ -318,7 +332,11 @@ uint8_t scanAccessPoints() {
       continue;
     }
     String ssid = WiFi.SSID(i);
-    if (!cs::apUsable(ssid.c_str(), bssid, activeConfig.ssid[0], activeConfig.ssid[1])) {
+    bool usable = cs::apUsable(ssid.c_str(), bssid, activeConfig.ssid[0], activeConfig.ssid[1]);
+    Serial.printf("  wifi %02x:%02x:%02x:..:%02x ch %2d %4d dBm %s %.20s\n", bssid[0], bssid[1], bssid[2], bssid[5],
+                  static_cast<int>(WiFi.channel(i)), static_cast<int>(WiFi.RSSI(i)), usable ? "use " : "skip",
+                  ssid.c_str());
+    if (!usable) {
       continue;
     }
     memcpy(scanAps[n].bssid, bssid, 6);
@@ -920,6 +938,14 @@ void netlinkSetSuppressed(bool value) {
 void netlinkRequestPark(const cs::ParkRequest &req) {
   setPendingPark(req);
   netlinkNotify();
+}
+
+bool netlinkWantsRadio() {
+  return radioWanted;
+}
+
+void netlinkSetBleIdle(bool idle) {
+  bleIdle = idle;
 }
 
 void netlinkEngineRunning() {

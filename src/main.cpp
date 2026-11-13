@@ -101,12 +101,11 @@ static constexpr int16_t SETTINGS_VALUE_W = 32;
 static constexpr int16_t SETTINGS_ROW_H = 28;
 static constexpr int16_t SETTINGS_WIFI_Y = 66;
 static constexpr int16_t SETTINGS_SOLAR_WATTS_Y = 100;
-static constexpr int16_t SETTINGS_DEMO_Y = 134;
-static constexpr int16_t SETTINGS_ROTATION_Y = 168;
-static constexpr int16_t SETTINGS_TIMEOUT_Y = 66;
-static constexpr int16_t SETTINGS_BATTERY_Y = 100;
-static constexpr int16_t SETTINGS_DIMMING_Y = 134;
+static constexpr int16_t SETTINGS_ROTATION_Y = 134;  // long press opens the Info page
 static constexpr int16_t SETTINGS_REPORT_Y = 168;
+static constexpr int16_t SETTINGS_TIMEOUT_Y = 76;
+static constexpr int16_t SETTINGS_BATTERY_Y = 116;
+static constexpr int16_t SETTINGS_DIMMING_Y = 156;
 static constexpr int16_t SETTINGS_LABELS_Y = 66;
 static constexpr int16_t SETTINGS_GRID_Y = 100;
 static constexpr int16_t SETTINGS_CYCLE_Y = 134;
@@ -2932,8 +2931,8 @@ static void drawSettingsPage(bool force = false) {
   if (settingsPageIndex == 0) {
     drawRow(SETTINGS_WIFI_Y, "WiFi", settingsServerActive ? "On" : "-", settingsServerActive);
     drawStepperRow(SETTINGS_SOLAR_WATTS_Y, "Solar W", String(solarArrayWatts));
-    drawRow(SETTINGS_DEMO_Y, "Demo mode", demoModeEnabled ? "On" : "-", demoModeEnabled);
     drawRow(SETTINGS_ROTATION_Y, "Rotation", String(screenRotationDegrees), false);
+    drawRow(SETTINGS_REPORT_Y, "Report", reportFlashing() ? "Sent" : "Send", reportFlashing());
   } else if (settingsPageIndex == 1) {
     drawRow(SETTINGS_TIMEOUT_Y, "Timeout", screenTimeoutText(), false);
 
@@ -2946,7 +2945,6 @@ static void drawSettingsPage(bool force = false) {
     drawAaCentered(AA_FONT_SMALL, batteryModeText(), 171, SETTINGS_BATTERY_Y - 1, WHITE);
 
     drawRow(SETTINGS_DIMMING_Y, "Dimming", backlightLevelText(), false);
-    drawRow(SETTINGS_REPORT_Y, "Report", reportFlashing() ? "Sent" : "Send", reportFlashing());
   } else {
     drawRow(SETTINGS_LABELS_Y, "Labels", showValueLabels ? "On" : "-", showValueLabels);
     drawRow(SETTINGS_GRID_Y, "Grid", showValueGrid ? "On" : "-", showValueGrid);
@@ -3577,30 +3575,6 @@ static void handleTap(int16_t x, int16_t y) {
         return;
       }
 
-      // Status report now, plus a position fix and a full network reading.
-      if (pointInRect(x, y, SETTINGS_ROW_X, SETTINGS_REPORT_Y, SETTINGS_VALUE_X + SETTINGS_VALUE_W - SETTINGS_ROW_X, SETTINGS_ROW_H)) {
-        // One report per minute, so repeated taps don't flood the topic.
-        static uint32_t lastReportMs = 0;
-        if (lastReportMs != 0 && millis() - lastReportMs < 60000UL) {
-          Serial.println("Report row tapped: ignored, a report was sent less than a minute ago");
-          settingsMessage = "Report already sent";
-          reportFlashStartMs = millis() ? millis() : 1;
-          settingsPageDrawn = false;
-          drawCurrentPage(true);
-          return;
-        }
-        bool queued = onlineEnabled() && !demoModeEnabled && telemetryQueueReport();
-        Serial.printf("Report row tapped: %s\n", queued ? "queued" : "not queued (online off, demo, or no sample yet)");
-        if (queued) {
-          lastReportMs = millis() ? millis() : 1;
-        }
-        settingsMessage = queued ? (settingsServerActive ? "Report: after hotspot" : "Report queued") : "Online is off";
-        reportFlashStartMs = queued ? (millis() ? millis() : 1) : 0;
-        settingsPageDrawn = false;
-        drawCurrentPage(true);
-        return;
-      }
-
       if (pointInRect(x, y, SETTINGS_BACK_X, SETTINGS_BACK_Y, SETTINGS_BACK_W, SETTINGS_BACK_H)) {
         closeSettingsPage();
         return;
@@ -3678,13 +3652,25 @@ static void handleTap(int16_t x, int16_t y) {
       return;
     }
 
-    if (pointInRect(x, y, SETTINGS_ROW_X, SETTINGS_DEMO_Y, SETTINGS_VALUE_X + SETTINGS_VALUE_W - SETTINGS_ROW_X, SETTINGS_ROW_H)) {
-      demoModeEnabled = !demoModeEnabled;
-      secrets.putBool("demo_mode", demoModeEnabled);
-      victronStats.valid = false;
-      solarStats.valid = false;
-      orionStats.valid = false;
-      settingsMessage = demoModeEnabled ? "Demo mode on" : "Demo mode off";
+    // Status report now, plus a position fix and a full network reading.
+    if (pointInRect(x, y, SETTINGS_ROW_X, SETTINGS_REPORT_Y, SETTINGS_VALUE_X + SETTINGS_VALUE_W - SETTINGS_ROW_X, SETTINGS_ROW_H)) {
+      // One report per minute, so repeated taps don't flood the topic.
+      static uint32_t lastReportMs = 0;
+      if (lastReportMs != 0 && millis() - lastReportMs < 60000UL) {
+        Serial.println("Report row tapped: ignored, a report was sent less than a minute ago");
+        settingsMessage = "Report already sent";
+        reportFlashStartMs = millis() ? millis() : 1;
+        settingsPageDrawn = false;
+        drawCurrentPage(true);
+        return;
+      }
+      bool queued = onlineEnabled() && !demoModeEnabled && telemetryQueueReport();
+      Serial.printf("Report row tapped: %s\n", queued ? "queued" : "not queued (online off, demo, or no sample yet)");
+      if (queued) {
+        lastReportMs = millis() ? millis() : 1;
+      }
+      settingsMessage = queued ? (settingsServerActive ? "Report: after hotspot" : "Report queued") : "Online is off";
+      reportFlashStartMs = queued ? (millis() ? millis() : 1) : 0;
       settingsPageDrawn = false;
       drawCurrentPage(true);
       return;
@@ -3711,14 +3697,14 @@ static void handleTap(int16_t x, int16_t y) {
   }
 }
 
-static bool isDemoModeRowPoint(int16_t x, int16_t y) {
+static bool isInfoHoldRowPoint(int16_t x, int16_t y) {
   if (settingsPageIndex != 0) {
     return false;
   }
   return pointInRect(x,
                      y,
                      SETTINGS_ROW_X,
-                     SETTINGS_DEMO_Y,
+                     SETTINGS_ROTATION_Y,
                      SETTINGS_VALUE_X + SETTINGS_VALUE_W - SETTINGS_ROW_X,
                      SETTINGS_ROW_H);
 }
@@ -3842,8 +3828,29 @@ static void drawGaugeValues(bool force = false) {
   gaugeValuesDrawn = true;
 }
 
+// The C3 has one radio: BLE scanning takes most of it, so a Wi-Fi scan would
+// miss most beacons. Netlink asks, loop() pauses BLE, then restarts it.
+static bool blePausedForWifi = false;
+
+static void serviceRadioShare() {
+  if (netlinkWantsRadio() && !captureActive) {
+    if (!blePausedForWifi) {
+      NimBLEDevice::getScan()->stop();
+      blePausedForWifi = true;
+    }
+    netlinkSetBleIdle(!NimBLEDevice::getScan()->isScanning());
+    return;
+  }
+  netlinkSetBleIdle(false);
+  if (blePausedForWifi) {
+    blePausedForWifi = false;
+    restartBleScan("after Wi-Fi scan");
+  }
+}
+
 static void updateBleWatchdog() {
-  if (captureActive) {
+  serviceRadioShare();
+  if (captureActive || blePausedForWifi) {
     return;
   }
 
@@ -4015,7 +4022,7 @@ static void updateTouchSwipe() {
       durationMs >= SETTINGS_INFO_HOLD_MS &&
       absDx < 32 &&
       absDy < 32 &&
-      isDemoModeRowPoint((startX + lastX) / 2, (startY + lastY) / 2)) {
+      isInfoHoldRowPoint((startX + lastX) / 2, (startY + lastY) / 2)) {
     openSettingsInfoPage();
     return;
   }
@@ -4078,7 +4085,7 @@ static void updateReportFlash() {
     return;
   }
   reportFlashStartMs = 0;
-  if (settingsPageActive && settingsPageIndex == 1) {
+  if (settingsPageActive && settingsPageIndex == 0) {
     settingsPageDrawn = false;
     drawCurrentPage(true);
   }

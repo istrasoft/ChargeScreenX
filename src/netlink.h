@@ -39,6 +39,10 @@ OnlineStatus netlinkStatus();
 void netlinkRequestPark(const cs::ParkRequest &req);
 // The engine is running: stops the moved-van watch. Called from loop().
 void netlinkEngineRunning();
+// Wi-Fi scans need the shared radio: while netlinkWantsRadio() is true, loop()
+// stops BLE scanning and reports netlinkSetBleIdle(true) once it has stopped.
+bool netlinkWantsRadio();
+void netlinkSetBleIdle(bool idle);
 
 // UTC from the system clock, plus the local offset (lookup or TZ override).
 cs::ClockNow clockNow();
