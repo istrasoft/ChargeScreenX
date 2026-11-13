@@ -1649,6 +1649,28 @@ inline bool apUsable(const char *ssid, const uint8_t *bssid, const char *own1, c
   return true;
 }
 
+// Routers give their extra networks (guest, hidden mesh backhaul) addresses
+// that differ only in the first and last bytes, e.g. f0:09:0d:..:e2 next to
+// ea:09:0d:..:e4. Such a network belongs to the same box as an own network.
+inline bool bssidSameDevice(const uint8_t *a, const uint8_t *b) {
+  return memcmp(a + 1, b + 1, 4) == 0;
+}
+
+// Removes access points that share a box with any of the own BSSIDs; returns the new count.
+inline uint8_t apDropOwnDevices(ApInfo *aps, uint8_t n, const uint8_t (*own)[6], uint8_t ownCount) {
+  uint8_t kept = 0;
+  for (uint8_t i = 0; i < n; i++) {
+    bool mine = false;
+    for (uint8_t j = 0; j < ownCount && !mine; j++) {
+      mine = bssidSameDevice(aps[i].bssid, own[j]);
+    }
+    if (!mine) {
+      aps[kept++] = aps[i];
+    }
+  }
+  return kept;
+}
+
 // Sorts strongest first; returns how many to keep.
 inline uint8_t apKeepStrongest(ApInfo *aps, uint8_t n, uint8_t keep) {
   for (uint8_t i = 1; i < n; i++) {

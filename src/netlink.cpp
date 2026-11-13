@@ -26,7 +26,8 @@ constexpr uint32_t MIN_LOOP_MS = 1000;
 constexpr uint32_t OFF_RECHECK_MS = 60000;         // Send = Off: recheck the setting this often
 constexpr uint32_t WATCH_INTERVAL_MS = 60UL * 60000UL;
 constexpr uint32_t WATCH_CONFIRM_MS = 5UL * 60000UL;
-constexpr uint32_t SCAN_MS_PER_CHANNEL = 300;
+constexpr uint32_t SCAN_MS_PER_CHANNEL = 300;          // active pass
+constexpr uint32_t SCAN_PASSIVE_MS_PER_CHANNEL = 600;  // passive pass: about 6 beacon intervals
 
 enum class Attempt : uint8_t { Done, Failed, RateLimited, Paused, Off };
 enum class ParkStep : uint8_t { Nothing, Queued, Retry };
@@ -318,36 +319,78 @@ uint8_t scanAccessPoints() {
     vTaskDelay(pdMS_TO_TICKS(20));
   }
   bool blePaused = bleIdle;
-  WiFi.persistent(false);
-  WiFi.mode(WIFI_STA);
-  int16_t found = WiFi.scanNetworks(false, false, false, SCAN_MS_PER_CHANNEL);
-  radioWanted = false;
   if (!blePaused) {
     Serial.println("Online: BLE scan not paused for the Wi-Fi scan");
   }
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_STA);
+  // Pass 1: active (probe requests, quick answers). Pass 2: passive, listening
+  // long enough on each channel for several beacons of weak networks.
+  // Both include hidden networks; results merge by BSSID, strongest RSSI kept.
+  const bool passive[2] = {false, true};
+  const uint32_t dwellMs[2] = {SCAN_MS_PER_CHANNEL, SCAN_PASSIVE_MS_PER_CHANNEL};
   uint8_t n = 0;
-  for (int16_t i = 0; i < found && n < cs::GEO_SCAN_MAX; i++) {
-    const uint8_t *bssid = WiFi.BSSID(i);
-    if (!bssid) {
-      continue;
+  int total = 0;
+  uint8_t own[4][6];  // BSSIDs of the configured networks, to drop their sibling networks
+  uint8_t ownCount = 0;
+  uint32_t scanStart = millis();
+  for (int pass = 0; pass < 2 && !paused; pass++) {
+    int16_t found = WiFi.scanNetworks(false, true, passive[pass], dwellMs[pass]);
+    for (int16_t i = 0; i < found; i++) {
+      const uint8_t *bssid = WiFi.BSSID(i);
+      if (!bssid) {
+        continue;
+      }
+      int32_t rssi = WiFi.RSSI(i);
+      int8_t rssi8 = static_cast<int8_t>(rssi < -127 ? -127 : (rssi > 0 ? 0 : rssi));
+      int known = -1;
+      for (uint8_t k = 0; k < n; k++) {
+        if (memcmp(scanAps[k].bssid, bssid, 6) == 0) {
+          known = k;
+          break;
+        }
+      }
+      String ssid = WiFi.SSID(i);
+      bool usable = cs::apUsable(ssid.c_str(), bssid, activeConfig.ssid[0], activeConfig.ssid[1]);
+      bool isOwn = ssid.length() && ((activeConfig.ssid[0][0] && ssid == activeConfig.ssid[0]) ||
+                                     (activeConfig.ssid[1][0] && ssid == activeConfig.ssid[1]));
+      if (isOwn && ownCount < 4) {
+        memcpy(own[ownCount++], bssid, 6);
+      }
+      if (known < 0) {
+        total++;
+        Serial.printf("  wifi %s %02x:%02x:%02x:..:%02x ch %2d %4d dBm %s %.20s\n", passive[pass] ? "passive" : "active ",
+                      bssid[0], bssid[1], bssid[2], bssid[5], static_cast<int>(WiFi.channel(i)), static_cast<int>(rssi),
+                      usable ? "use " : "skip", ssid.length() ? ssid.c_str() : "(hidden)");
+      }
+      if (!usable) {
+        continue;
+      }
+      if (known >= 0) {
+        if (rssi8 > scanAps[known].rssi) {
+          scanAps[known].rssi = rssi8;
+        }
+        continue;
+      }
+      if (n < cs::GEO_SCAN_MAX) {
+        memcpy(scanAps[n].bssid, bssid, 6);
+        scanAps[n].rssi = rssi8;
+        scanAps[n].channel = static_cast<uint8_t>(WiFi.channel(i));
+        n++;
+      }
     }
-    String ssid = WiFi.SSID(i);
-    bool usable = cs::apUsable(ssid.c_str(), bssid, activeConfig.ssid[0], activeConfig.ssid[1]);
-    Serial.printf("  wifi %02x:%02x:%02x:..:%02x ch %2d %4d dBm %s %.20s\n", bssid[0], bssid[1], bssid[2], bssid[5],
-                  static_cast<int>(WiFi.channel(i)), static_cast<int>(WiFi.RSSI(i)), usable ? "use " : "skip",
-                  ssid.c_str());
-    if (!usable) {
-      continue;
-    }
-    memcpy(scanAps[n].bssid, bssid, 6);
-    int32_t rssi = WiFi.RSSI(i);
-    scanAps[n].rssi = static_cast<int8_t>(rssi < -127 ? -127 : (rssi > 0 ? 0 : rssi));
-    scanAps[n].channel = static_cast<uint8_t>(WiFi.channel(i));
-    n++;
+    WiFi.scanDelete();
   }
-  WiFi.scanDelete();
+  radioWanted = false;
+  uint8_t before = n;
+  n = cs::apDropOwnDevices(scanAps, n, own, ownCount);
+  if (n != before) {
+    Serial.printf("Online: dropped %u networks from the same box as WiFi 1/2 (guest, mesh backhaul)\n",
+                  static_cast<unsigned>(before - n));
+  }
   uint8_t kept = cs::apKeepStrongest(scanAps, n, cs::GEO_KEEP_APS);
-  Serial.printf("Online: scan found %d networks, %u usable\n", static_cast<int>(found), kept);
+  Serial.printf("Online: scan found %d networks in %lu ms, %u usable\n", total,
+                static_cast<unsigned long>(millis() - scanStart), kept);
   return kept;
 }
 

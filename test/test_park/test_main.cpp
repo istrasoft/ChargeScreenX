@@ -133,6 +133,20 @@ static void test_ap_filter_and_sort() {
   TEST_ASSERT_FALSE(cs::apUsable("Phone", normal, "Van", "Phone"));
   TEST_ASSERT_FALSE(cs::apUsable("Cafe", local, "Van", "Phone"));
   TEST_ASSERT_FALSE(cs::apUsable("Home_nomap", normal, "Van", "Phone"));
+  // The Deco's hidden backhaul seen in the van: f0:09:0d:..:e2 beside ea:09:0d:..:e4.
+  const uint8_t deco[6] = {0xea, 0x09, 0x0d, 0x11, 0x22, 0xe4};
+  cs::ApInfo mixed[3];
+  const uint8_t backhaul[6] = {0xf0, 0x09, 0x0d, 0x11, 0x22, 0xe2};
+  const uint8_t other[6] = {0x10, 0x09, 0x0d, 0x99, 0x22, 0xe2};
+  memcpy(mixed[0].bssid, backhaul, 6);
+  memcpy(mixed[1].bssid, other, 6);
+  memcpy(mixed[2].bssid, normal, 6);
+  const uint8_t own[1][6] = {{deco[0], deco[1], deco[2], deco[3], deco[4], deco[5]}};
+  TEST_ASSERT_TRUE(cs::bssidSameDevice(backhaul, deco));
+  TEST_ASSERT_FALSE(cs::bssidSameDevice(other, deco));
+  TEST_ASSERT_EQUAL_UINT8(2, cs::apDropOwnDevices(mixed, 3, own, 1));
+  TEST_ASSERT_TRUE(memcmp(mixed[0].bssid, other, 6) == 0);
+
   cs::ApInfo aps[20];
   for (int i = 0; i < 20; i++) {
     aps[i] = ap(static_cast<uint8_t>(i), static_cast<int8_t>(-90 + i));
