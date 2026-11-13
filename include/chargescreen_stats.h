@@ -551,7 +551,8 @@ enum class MsgKind : uint8_t {
   Test = 5,
   Park = 6,
   Starter = 7,
-  Moved = 8
+  Moved = 8,
+  Status = 9
 };
 
 constexpr const char *TEST_BODY = "Online sending works.";
@@ -574,6 +575,8 @@ inline const char *kindName(MsgKind k) {
       return "starter";
     case MsgKind::Moved:
       return "moved";
+    case MsgKind::Status:
+      return "status";
     default:
       return "test";
   }
@@ -597,6 +600,8 @@ inline const char *kindTitle(MsgKind k) {
       return "Starter battery low";
     case MsgKind::Moved:
       return "Van moved?";
+    case MsgKind::Status:
+      return "Status report";
     default:
       return "ChargeScreen test";
   }
@@ -619,6 +624,8 @@ inline const char *kindTag(MsgKind k) {
       return "battery";
     case MsgKind::Moved:
       return "rotating_light";
+    case MsgKind::Status:
+      return "clipboard";
     default:
       return "";
   }

@@ -103,9 +103,10 @@ static constexpr int16_t SETTINGS_WIFI_Y = 66;
 static constexpr int16_t SETTINGS_SOLAR_WATTS_Y = 100;
 static constexpr int16_t SETTINGS_DEMO_Y = 134;
 static constexpr int16_t SETTINGS_ROTATION_Y = 168;
-static constexpr int16_t SETTINGS_TIMEOUT_Y = 76;
-static constexpr int16_t SETTINGS_BATTERY_Y = 116;
-static constexpr int16_t SETTINGS_DIMMING_Y = 156;
+static constexpr int16_t SETTINGS_TIMEOUT_Y = 66;
+static constexpr int16_t SETTINGS_BATTERY_Y = 100;
+static constexpr int16_t SETTINGS_DIMMING_Y = 134;
+static constexpr int16_t SETTINGS_REPORT_Y = 168;
 static constexpr int16_t SETTINGS_LABELS_Y = 66;
 static constexpr int16_t SETTINGS_GRID_Y = 100;
 static constexpr int16_t SETTINGS_CYCLE_Y = 134;
@@ -602,6 +603,14 @@ static String backlightLevelText() {
 
 static String cycleText() {
   return cycleSeconds ? String(cycleSeconds) + "s" : String("-");
+}
+
+// The Report row stays green ("Sent") for a moment after a tap.
+static constexpr uint32_t REPORT_FLASH_MS = 2000;
+static uint32_t reportFlashStartMs = 0;  // 0 = not flashing
+
+static bool reportFlashing() {
+  return reportFlashStartMs != 0 && millis() - reportFlashStartMs < REPORT_FLASH_MS;
 }
 
 static String sendText() {
@@ -2937,6 +2946,7 @@ static void drawSettingsPage(bool force = false) {
     drawAaCentered(AA_FONT_SMALL, batteryModeText(), 171, SETTINGS_BATTERY_Y - 1, WHITE);
 
     drawRow(SETTINGS_DIMMING_Y, "Dimming", backlightLevelText(), false);
+    drawRow(SETTINGS_REPORT_Y, "Report", reportFlashing() ? "Sent" : "Send", reportFlashing());
   } else {
     drawRow(SETTINGS_LABELS_Y, "Labels", showValueLabels ? "On" : "-", showValueLabels);
     drawRow(SETTINGS_GRID_Y, "Grid", showValueGrid ? "On" : "-", showValueGrid);
@@ -3567,6 +3577,30 @@ static void handleTap(int16_t x, int16_t y) {
         return;
       }
 
+      // Status report now, plus a position fix and a full network reading.
+      if (pointInRect(x, y, SETTINGS_ROW_X, SETTINGS_REPORT_Y, SETTINGS_VALUE_X + SETTINGS_VALUE_W - SETTINGS_ROW_X, SETTINGS_ROW_H)) {
+        // One report per minute, so repeated taps don't flood the topic.
+        static uint32_t lastReportMs = 0;
+        if (lastReportMs != 0 && millis() - lastReportMs < 60000UL) {
+          Serial.println("Report row tapped: ignored, a report was sent less than a minute ago");
+          settingsMessage = "Report already sent";
+          reportFlashStartMs = millis() ? millis() : 1;
+          settingsPageDrawn = false;
+          drawCurrentPage(true);
+          return;
+        }
+        bool queued = onlineEnabled() && !demoModeEnabled && telemetryQueueReport();
+        Serial.printf("Report row tapped: %s\n", queued ? "queued" : "not queued (online off, demo, or no sample yet)");
+        if (queued) {
+          lastReportMs = millis() ? millis() : 1;
+        }
+        settingsMessage = queued ? (settingsServerActive ? "Report: after hotspot" : "Report queued") : "Online is off";
+        reportFlashStartMs = queued ? (millis() ? millis() : 1) : 0;
+        settingsPageDrawn = false;
+        drawCurrentPage(true);
+        return;
+      }
+
       if (pointInRect(x, y, SETTINGS_BACK_X, SETTINGS_BACK_Y, SETTINGS_BACK_W, SETTINGS_BACK_H)) {
         closeSettingsPage();
         return;
@@ -4039,6 +4073,17 @@ static cs::Sample telemetrySample() {
   return sample;
 }
 
+static void updateReportFlash() {
+  if (reportFlashStartMs == 0 || reportFlashing()) {
+    return;
+  }
+  reportFlashStartMs = 0;
+  if (settingsPageActive && settingsPageIndex == 1) {
+    settingsPageDrawn = false;
+    drawCurrentPage(true);
+  }
+}
+
 static void updateAutoCycle() {
   if (!screenAwake || cycleSeconds == 0 || captureActive || captureReadyScreenActive ||
       settingsPageActive || settingsRotationPageActive || settingsInfoPageActive) {
@@ -4100,6 +4145,7 @@ void loop() {
   persistVictronLock(orionLock, "orion_mac");
   updateTouchSwipe();
   updateAutoCycle();
+  updateReportFlash();
   updateScreenTimeout();
   netlinkSetSuppressed(demoModeEnabled);
   if (telemetrySampleDue(millis())) {

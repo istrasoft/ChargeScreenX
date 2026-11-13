@@ -385,6 +385,10 @@ static void test_ntfy_click_and_kinds() {
   TEST_ASSERT_EQUAL_UINT8(4, cs::kindPriority(cs::MsgKind::Moved));
   TEST_ASSERT_EQUAL_STRING("Van moved?", cs::kindTitle(cs::MsgKind::Moved));
   TEST_ASSERT_EQUAL_STRING("battery", cs::kindTag(cs::MsgKind::Starter));
+  TEST_ASSERT_EQUAL_STRING("status", cs::kindName(cs::MsgKind::Status));
+  TEST_ASSERT_EQUAL_STRING("Status report", cs::kindTitle(cs::MsgKind::Status));
+  TEST_ASSERT_EQUAL_STRING("clipboard", cs::kindTag(cs::MsgKind::Status));
+  TEST_ASSERT_EQUAL_UINT8(3, cs::kindPriority(cs::MsgKind::Status));
 }
 
 int main(int, char **) {

@@ -47,6 +47,8 @@ ChargeScreen can join WiFi only when it has something to send, and push to an HT
 
 The batch interval can also be changed on the device: settings page 3, **Send** row (15m, 30m, 1h, 2h, 4h, or `-` for Off). With Off, records are only sent along with other messages.
 
+Settings page 2, **Report** row: sends a **Status report** (battery now, days left) and a position and network reading (as a Parked message) right away. The row turns green ("Sent") when it is queued; further taps within a minute are ignored.
+
 Set it up in the **Online** section of the setup page: up to two WiFi networks, the URL, and optionally a POSIX time zone such as `CET-1CEST,M3.5.0,M10.5.0/3` (otherwise the time zone is looked up from the IP address once a day). Use an ntfy topic URL such as `https://ntfy.sh/your_topic` and subscribe to it in the ntfy app, or your own endpoint, which receives JSON (`{"v":1,"kind":...,"title":...,"message":...,"priority":...,"time":...,"data":{...}}`). For a protected ntfy topic (or an endpoint that needs a key), set **Access token**: it is sent as `Authorization: Bearer <token>` only to that URL, and changing the URL removes it. A 401 or 403 reply keeps the messages queued and shows `Error` until the token is fixed. **Send test message** checks the setup once the hotspot turns off. The info screen shows `Online: Off`, `Waiting`, `No WiFi`, `Sent HH:MM` or `Error HH:MM`.
 
 While offline, up to 24 hours of records and 16 alerts or reports are kept on the device and sent later; late messages say when they happened. Battery capacity is learned from the shunt, so the remaining Ah and days estimates appear after a while. Nothing is sent in demo mode, and TLS certificates are not checked, so don't use it with an endpoint that needs a password.

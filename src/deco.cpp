@@ -171,7 +171,8 @@ bool aesDecrypt(const char *b64, size_t b64Len, char *out, size_t cap) {
 }
 
 // POST and keep the response text in respBuf. wantCookie captures sysauth.
-int post(const char *url, const char *body, bool wantCookie) {
+// The key requests go out bare, like the library's; the signed ones say JSON.
+int post(const char *url, const char *body, bool wantCookie, bool json = true) {
   WiFiClient client;
   HTTPClient http;
   http.setConnectTimeout(DECO_TIMEOUT_MS);
@@ -179,7 +180,9 @@ int post(const char *url, const char *body, bool wantCookie) {
   if (!http.begin(client, url)) {
     return -1;
   }
-  http.addHeader("Content-Type", "application/json");
+  if (json) {
+    http.addHeader("Content-Type", "application/json");
+  }
   if (sysauth[0]) {
     char cookie[112];
     snprintf(cookie, sizeof(cookie), "sysauth=%s", sysauth);
@@ -273,15 +276,17 @@ bool readSignal(const char *host, const char *password, cs::DecoSignal &sig) {
   char url[160];
 
   snprintf(url, sizeof(url), "http://%s/cgi-bin/luci/;stok=/login?form=keys&operation=read", host);
-  if (post(url, "", false) != 200 || !readStringPair(respBuf, "password", pwdN, sizeof(pwdN), pwdE, sizeof(pwdE))) {
-    Serial.println("Deco: no password key");
+  int code = post(url, "", false, false);
+  if (code != 200 || !readStringPair(respBuf, "password", pwdN, sizeof(pwdN), pwdE, sizeof(pwdE))) {
+    Serial.printf("Deco: no password key from %s (HTTP %d): %.100s\n", host, code, respBuf);
     return false;
   }
   snprintf(url, sizeof(url), "http://%s/cgi-bin/luci/;stok=/login?form=auth&operation=read", host);
   double seq = 0;
-  if (post(url, "", false) != 200 || !readStringPair(respBuf, "key", sigN, sizeof(sigN), sigE, sizeof(sigE)) ||
+  code = post(url, "", false, false);
+  if (code != 200 || !readStringPair(respBuf, "key", sigN, sizeof(sigN), sigE, sizeof(sigE)) ||
       !cs::jsonReadNumber(cs::jsonValueAfterKey(respBuf, "seq"), seq)) {
-    Serial.println("Deco: no auth key");
+    Serial.printf("Deco: no auth key (HTTP %d): %.100s\n", code, respBuf);
     return false;
   }
   seqBase = static_cast<uint32_t>(seq);
@@ -309,7 +314,7 @@ bool readSignal(const char *host, const char *password, cs::DecoSignal &sig) {
   snprintf(login, sizeof(buf->login), "{\"params\":{\"password\":\"%s\"},\"operation\":\"login\"}", pwdHex);
   snprintf(url, sizeof(url), "http://%s/cgi-bin/luci/;stok=/login?form=login", host);
   if (!securePost(url, login, true) || !readString(plainBuf, "stok", stok, sizeof(stok)) || !sysauth[0]) {
-    Serial.println("Deco: login failed");
+    Serial.printf("Deco: login failed (cookie %s): %.100s\n", sysauth[0] ? "yes" : "no", respBuf);
     return false;
   }
 

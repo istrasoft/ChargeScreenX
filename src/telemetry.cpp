@@ -427,6 +427,10 @@ uint32_t lastSampleMs = 0;
 uint8_t samplesThisMinute = 0;
 cs::EngineTracker engineTracker;
 cs::StarterWatch starterWatch;
+cs::Sample lastSample;  // for on-demand reports
+bool haveSample = false;
+bool lastHasSolarKey = false;
+bool lastHasOrionKey = false;
 
 void queueMessage(const cs::Message &msg);
 
@@ -566,8 +570,13 @@ void telemetryLoop(const cs::Sample &sample, bool demoMode, bool hasSolarKey, bo
     samplesThisMinute = 0;
     engineTracker = cs::EngineTracker();
     starterWatch = cs::StarterWatch();
+    haveSample = false;
     return;
   }
+  lastSample = sample;
+  haveSample = true;
+  lastHasSolarKey = hasSolarKey;
+  lastHasOrionKey = hasOrionKey;
   if (!wasActive) {
     drainMonitor = cs::DrainMonitor();  // a window from before the pause must not fire a false alert
     wasActive = true;
@@ -617,6 +626,43 @@ void telemetryLoop(const cs::Sample &sample, bool demoMode, bool hasSolarKey, bo
       storeSaveDays(dayHistory);
     }
   }
+}
+
+bool telemetryQueueReport() {
+  if (!telemetryEnabled || !haveSample) {
+    return false;
+  }
+  cs::ClockNow clock = clockNow();
+  uint32_t unixOr0 = clock.utcValid ? clock.unixUtc : 0;
+  uint32_t nowMs = millis();
+  cs::Message msg;
+  cs::messageInit(msg, cs::MsgKind::Status, storeBootId(), unixOr0, nowMs);
+  size_t len = 0;
+  if (lastSample.shuntValid && cs::socKnown(lastSample.soc)) {
+    float remaining = cs::remainingAh(capacityLearner, lastSample.soc);
+    cs::DaysEstimate estimate = cs::daysRemaining(dayHistory, telemetrySettings.daysAvg, remaining, lastHasSolarKey);
+    const cs::DayStats *yesterday =
+        dayHistory.current.day != cs::NO_DAY ? cs::dayHistoryFind(dayHistory, dayHistory.current.day - 1) : nullptr;
+    if (yesterday && !cs::dayComplete(*yesterday)) {
+      yesterday = nullptr;
+    }
+    len = cs::buildMorningBody(msg.body, sizeof(msg.body), lastSample.soc, remaining, estimate, yesterday,
+                               lastHasSolarKey, lastHasOrionKey);
+  }
+  if (len == 0) {
+    snprintf(msg.body, sizeof(msg.body), "No battery data right now.");
+  }
+  if (!storeEnqueueMessage(msg)) {
+    return false;
+  }
+  cs::ParkRequest req;
+  req.offUnix = unixOr0;
+  req.offMs = nowMs;
+  req.runS = 0;
+  req.boot = storeBootId();
+  netlinkRequestPark(req);  // also wakes netlink
+  Serial.println("Online: report requested on the device");
+  return true;
 }
 
 bool telemetryQueueTest() {

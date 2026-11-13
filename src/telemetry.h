@@ -31,3 +31,6 @@ void telemetryConfigure(const cs::OnlineSettings &settings, bool enabled);
 bool telemetrySampleDue(uint32_t nowMs);
 void telemetryLoop(const cs::Sample &sample, bool demoMode, bool hasSolarKey, bool hasOrionKey);
 bool telemetryQueueTest();
+// On-demand report: battery status now, then a position fix and a full
+// network reading (as a park message with run 0). False when not active.
+bool telemetryQueueReport();
