@@ -978,7 +978,9 @@ inline void putField0(TextWriter &w, const char *key, float v) {
   }
 }
 
-inline size_t buildBatchJson(char *out, size_t cap, const Record *recs, uint8_t count) {
+// netJson: optional {"type":..} object from buildNetJson, added as "net" after the records.
+inline size_t buildBatchJson(char *out, size_t cap, const Record *recs, uint8_t count,
+                             const char *netJson = nullptr) {
   TextWriter w(out, cap);
   w.putStr("{\"v\":1,\"recs\":[");
   for (uint8_t k = 0; k < count; k++) {
@@ -1002,7 +1004,12 @@ inline size_t buildBatchJson(char *out, size_t cap, const Record *recs, uint8_t 
     putField1(w, "sa", r.sa);
     w.putChar('}');
   }
-  w.putStr("]}");
+  w.putChar(']');
+  if (netJson && netJson[0]) {
+    w.putStr(",\"net\":");
+    w.putStr(netJson);
+  }
+  w.putChar('}');
   return w.result();
 }
 
@@ -1891,11 +1898,13 @@ constexpr size_t DECO_PASS_MAX = 64;
 
 struct DecoSignal {
   bool valid = false;
-  char net[16] = {};
+  char net[16] = {};  // Deco network_type, e.g. "lte_plus"
   float rsrp = NAN;
   float rsrq = NAN;
   float snr = NAN;
-  float lvl = NAN;
+  float rssi = NAN;
+  float lvl = NAN;   // Deco's own signal_strength, 0-100
+  double du = NAN;   // Deco data_usage counter (unit unconfirmed, resettable)
 };
 
 // Empty is valid (feature off). Printable ASCII only.
@@ -1943,9 +1952,221 @@ inline bool parseDecoSignal(const char *json, DecoSignal &sig) {
   sig.rsrp = jsonNumberOrNan(jsonValueIn(cpe, end, "rsrp"));
   sig.rsrq = jsonNumberOrNan(jsonValueIn(cpe, end, "rsrq"));
   sig.snr = jsonNumberOrNan(jsonValueIn(cpe, end, "snr"));
+  sig.rssi = jsonNumberOrNan(jsonValueIn(cpe, end, "rssi"));
   sig.lvl = jsonNumberOrNan(jsonValueIn(cpe, end, "signal_strength"));
-  sig.valid = sig.net[0] || std::isfinite(sig.rsrp) || std::isfinite(sig.lvl);
+  double du = 0;
+  if (jsonReadNumber(jsonValueIn(cpe, end, "data_usage"), du) && du >= 0) {
+    sig.du = du;
+  }
+  sig.valid = sig.net[0] || std::isfinite(sig.rsrp) || std::isfinite(sig.rssi) || std::isfinite(sig.lvl);
   return sig.valid;
+}
+
+// ---------------------------------------------------------------- network quality
+
+// "5G", "4G+", "4G", "3G", "2G", or "" when unknown.
+inline const char *netTypeLabel(const char *t) {
+  if (!t || !t[0]) {
+    return "";
+  }
+  if (strncmp(t, "5g", 2) == 0 || strncmp(t, "nr", 2) == 0) {
+    return "5G";
+  }
+  if (strcmp(t, "lte_plus") == 0 || strcmp(t, "lte_a") == 0 || strcmp(t, "lte-a") == 0) {
+    return "4G+";
+  }
+  if (strncmp(t, "lte", 3) == 0) {
+    return "4G";
+  }
+  const char *g3[] = {"wcdma", "umts", "hspa", "hsdpa", "hsupa", "td_scdma", "3g"};
+  for (const char *p : g3) {
+    if (strncmp(t, p, strlen(p)) == 0) {
+      return "3G";
+    }
+  }
+  const char *g2[] = {"gsm", "gprs", "edge", "2g"};
+  for (const char *p : g2) {
+    if (strncmp(t, p, strlen(p)) == 0) {
+      return "2G";
+    }
+  }
+  return "";
+}
+
+inline float scale01(float v, float lo, float hi) {
+  float s = (v - lo) / (hi - lo);
+  return s < 0.0f ? 0.0f : (s > 1.0f ? 1.0f : s);
+}
+
+// Coverage 0-100: how well the van reaches the mast (RSRP; RSSI on 3G/2G). -1 = unknown.
+inline int coverageScore(const DecoSignal &s) {
+  if (std::isfinite(s.rsrp)) {
+    return static_cast<int>(std::lround(100.0f * scale01(s.rsrp, -120.0f, -80.0f)));
+  }
+  if (std::isfinite(s.rssi)) {
+    return static_cast<int>(std::lround(100.0f * scale01(s.rssi, -110.0f, -60.0f)));
+  }
+  return -1;
+}
+
+// Quality 0-100: interference and cell load (60% SNR, 40% RSRQ). -1 = unknown.
+inline int qualityScore(const DecoSignal &s) {
+  bool hasSnr = std::isfinite(s.snr);
+  bool hasRsrq = std::isfinite(s.rsrq);
+  float snr = hasSnr ? scale01(s.snr, -5.0f, 20.0f) : 0.0f;
+  float rsrq = hasRsrq ? scale01(s.rsrq, -20.0f, -5.0f) : 0.0f;
+  float q;
+  if (hasSnr && hasRsrq) {
+    q = 0.6f * snr + 0.4f * rsrq;
+  } else if (hasSnr) {
+    q = snr;
+  } else if (hasRsrq) {
+    q = rsrq;
+  } else {
+    return -1;
+  }
+  return static_cast<int>(std::lround(100.0f * q));
+}
+
+constexpr const char *LATENCY_URL = "http://connectivitycheck.gstatic.com/generate_204";
+constexpr const char *SPEED_URL = "https://speed.cloudflare.com/__down?bytes=102400";
+constexpr uint32_t SPEED_BYTES = 102400;
+constexpr uint32_t SPEED_INTERVAL_MS = 4UL * 3600000UL;  // while parked
+
+// One reading of the mobile connection: Deco radio values plus measured lag and speed.
+struct NetReading {
+  DecoSignal sig;
+  int32_t ms = -1;    // median HTTP round trip, -1 = not measured
+  int32_t kbps = -1;  // 100 KB download speed, -1 = not measured
+};
+
+inline bool netReadingAny(const NetReading &r) {
+  return r.sig.valid || r.ms >= 0 || r.kbps >= 0;
+}
+
+// Median of the non-negative values; -1 when fewer than 2 succeeded.
+inline int32_t medianMs(const int32_t *v, uint8_t n) {
+  int32_t ok[8];
+  uint8_t k = 0;
+  for (uint8_t i = 0; i < n && k < 8; i++) {
+    if (v[i] >= 0) {
+      ok[k++] = v[i];
+    }
+  }
+  if (k < 2) {
+    return -1;
+  }
+  for (uint8_t i = 1; i < k; i++) {
+    int32_t x = ok[i];
+    int j = static_cast<int>(i) - 1;
+    while (j >= 0 && ok[j] > x) {
+      ok[j + 1] = ok[j];
+      j--;
+    }
+    ok[j + 1] = x;
+  }
+  return k % 2 ? ok[k / 2] : (ok[k / 2 - 1] + ok[k / 2]) / 2;
+}
+
+// bytes in ms -> kbit/s (bits per millisecond).
+inline int32_t throughputKbps(uint32_t bytes, uint32_t ms) {
+  if (ms == 0 || bytes == 0) {
+    return -1;
+  }
+  return static_cast<int32_t>((static_cast<uint64_t>(bytes) * 8U) / ms);
+}
+
+// {"type":"4G+","cov":60,"qual":25,"ms":48,"kbps":2400,"rsrp":-96,...}; 0 when there is nothing.
+inline size_t buildNetJson(char *out, size_t cap, const NetReading &r) {
+  TextWriter w(out, cap);
+  if (!netReadingAny(r)) {
+    return 0;
+  }
+  w.putChar('{');
+  bool first = true;
+  auto sep = [&]() {
+    if (!first) {
+      w.putChar(',');
+    }
+    first = false;
+  };
+  const char *type = netTypeLabel(r.sig.net);
+  if (type[0]) {
+    sep();
+    w.putf("\"type\":\"%s\"", type);
+  }
+  int cov = r.sig.valid ? coverageScore(r.sig) : -1;
+  int qual = r.sig.valid ? qualityScore(r.sig) : -1;
+  if (cov >= 0) {
+    sep();
+    w.putf("\"cov\":%d", cov);
+  }
+  if (qual >= 0) {
+    sep();
+    w.putf("\"qual\":%d", qual);
+  }
+  if (r.ms >= 0) {
+    sep();
+    w.putf("\"ms\":%ld", static_cast<long>(r.ms));
+  }
+  if (r.kbps >= 0) {
+    sep();
+    w.putf("\"kbps\":%ld", static_cast<long>(r.kbps));
+  }
+  if (r.sig.valid) {
+    const char *keys[] = {"rsrp", "rsrq", "snr", "rssi", "lvl"};
+    const float vals[] = {r.sig.rsrp, r.sig.rsrq, r.sig.snr, r.sig.rssi, r.sig.lvl};
+    for (int k = 0; k < 5; k++) {
+      if (std::isfinite(vals[k])) {
+        sep();
+        if (k == 2) {
+          w.putf("\"%s\":%.1f", keys[k], static_cast<double>(roundTo(vals[k], 10.0f)));
+        } else {
+          w.putf("\"%s\":%.0f", keys[k], static_cast<double>(roundTo(vals[k], 1.0f)));
+        }
+      }
+    }
+    if (std::isfinite(r.sig.du)) {
+      sep();
+      w.putf("\"du\":%.0f", r.sig.du);
+    }
+  }
+  w.putChar('}');
+  return w.result();
+}
+
+// " · 4G+ cov 60 qual 25 · 48 ms · 2.4 Mbit/s" from a net JSON object [obj, end).
+inline void putNetText(TextWriter &w, const char *obj, const char *end) {
+  const char *type = jsonValueIn(obj, end, "type");
+  double cov = 0, qual = 0, ms = 0, kbps = 0;
+  bool hasCov = jsonReadNumber(jsonValueIn(obj, end, "cov"), cov);
+  bool hasQual = jsonReadNumber(jsonValueIn(obj, end, "qual"), qual);
+  if ((type && *type == '"') || hasCov || hasQual) {
+    w.putStr(" \xC2\xB7 ");
+    if (type && *type == '"') {
+      for (const char *p = type + 1; *p && *p != '"'; ++p) {
+        w.putChar(*p);
+      }
+    } else {
+      w.putStr("mobile");
+    }
+    if (hasCov) {
+      w.putf(" cov %.0f", cov);
+    }
+    if (hasQual) {
+      w.putf(" qual %.0f", qual);
+    }
+  }
+  if (jsonReadNumber(jsonValueIn(obj, end, "ms"), ms)) {
+    w.putf(" \xC2\xB7 %.0f ms", ms);
+  }
+  if (jsonReadNumber(jsonValueIn(obj, end, "kbps"), kbps)) {
+    if (kbps >= 1000.0) {
+      w.putf(" \xC2\xB7 %.1f Mbit/s", kbps / 1000.0);
+    } else {
+      w.putf(" \xC2\xB7 %.0f kbit/s", kbps);
+    }
+  }
 }
 
 // Deco request signature text; is the plaintext RSA-encrypted in 53-byte pieces.
@@ -1985,7 +2206,7 @@ struct ParkResult {
   float lon = NAN;
   uint32_t acc = 0;
   uint8_t aps = 0;
-  DecoSignal sig;
+  NetReading net;
 };
 
 inline bool parkHasPosition(const ParkResult &r) {
@@ -2002,29 +2223,10 @@ inline size_t buildParkData(char *out, size_t cap, const ParkResult &r) {
            static_cast<unsigned long>(r.acc));
   }
   w.putf(",\"aps\":%u", static_cast<unsigned>(r.aps));
-  if (r.sig.valid) {
-    w.putStr(",\"sig\":{");
-    bool first = true;
-    if (r.sig.net[0]) {
-      w.putStr("\"net\":\"");
-      w.putEscaped(r.sig.net);
-      w.putChar('"');
-      first = false;
-    }
-    const char *keys[] = {"rsrp", "rsrq", "snr", "lvl"};
-    const float vals[] = {r.sig.rsrp, r.sig.rsrq, r.sig.snr, r.sig.lvl};
-    for (int k = 0; k < 4; k++) {
-      if (std::isfinite(vals[k])) {
-        w.putf("%s\"%s\":", first ? "" : ",", keys[k]);
-        if (k == 2) {
-          w.putf("%.1f", static_cast<double>(roundTo(vals[k], 10.0f)));
-        } else {
-          w.putf("%.0f", static_cast<double>(roundTo(vals[k], 1.0f)));
-        }
-        first = false;
-      }
-    }
-    w.putChar('}');
+  char net[192];
+  if (buildNetJson(net, sizeof(net), r.net) > 0) {
+    w.putStr(",\"net\":");
+    w.putStr(net);
   }
   w.putChar('}');
   return w.result();
@@ -2060,15 +2262,10 @@ inline size_t buildParkText(char *out, size_t cap, const char *data, char *click
     w.putStr(" \xC2\xB7 drove ");
     putDuration(w, static_cast<uint32_t>(run));
   }
-  const char *sig = jsonValueAfterKey(data, "sig");
-  const char *sigEnd = jsonObjectEnd(sig);
-  if (sigEnd) {
-    double v = 0;
-    if (jsonReadNumber(jsonValueIn(sig, sigEnd, "rsrp"), v)) {
-      w.putf(" \xC2\xB7 4G %.0f dBm", v);
-    } else if (jsonReadNumber(jsonValueIn(sig, sigEnd, "lvl"), v)) {
-      w.putf(" \xC2\xB7 4G %.0f%%", v);
-    }
+  const char *net = jsonValueAfterKey(data, "net");
+  const char *netEnd = jsonObjectEnd(net);
+  if (netEnd) {
+    putNetText(w, net, netEnd);
   }
   return w.result();
 }

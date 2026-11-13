@@ -1,4 +1,4 @@
-# Van test day: beta4.18
+# Van test day: beta4.19
 
 What to do in the vehicle, in order. Everything is on branch `firmware`. Spec: `design/specs/2026-11-04-parking-position-design.md`. Plan and status: `design/plans/2026-11-04-parking-position.md`.
 
@@ -12,10 +12,8 @@ What to do in the vehicle, in order. Everything is on branch `firmware`. Spec: `
 Both tools only read; nothing is changed or paired.
 
 - [ ] **BLE survey**: `tools/ble-survey/README.md`. About 3 minutes. Share `ble_survey.json` (personal devices are already left out). We look for thermometers, gas-level sensors, BMS modules.
-- [ ] **Deco probe**: laptop on the Deco Wi-Fi, Deco app closed, then `tools/deco-probe/README.md`. Share `cell_summary.json` only (not `deco_dump.json`).
-  - If it shows `mobile_cpe` fields such as `rsrp`, the firmware's 4G signal reading should work: set the Deco password in step 3.
-  - If the login fails or there is no `mobile_cpe`, leave the Deco password empty. Everything else works without it.
-  - If it lists cell ID / TAC / MCC / MNC fields, tell me: that enables a cell-tower follow-up.
+- [x] **Deco probe** (done 2026-11-13): the login works and gives the signal values; there is no cell ID, TAC, MCC or MNC.
+- [ ] **Wi-Fi positioning from the laptop**: `tools/geo-test/README.md` (turn on Windows Location services first). Checks the Google key and the accuracy at the van's spot.
 
 ## 2. Flash
 
@@ -33,7 +31,7 @@ git checkout -- include/build_version.h
 pio device monitor -b 115200
 ```
 
-The info screen should show **beta4.18**. The first boot discards the old record cache once (the record layout grew), so unsent records from before the flash are lost.
+The info screen should show **beta4.19**. The first boot discards the old record cache once (the record layout grew), so unsent records from before the flash are lost.
 
 ## 3. Settings (setup hotspot: Settings → WiFi row → join `ChargeScreen` → http://192.168.4.1/)
 
@@ -49,7 +47,8 @@ Tick each one and note anything odd (serial log lines start with `Online:` or `D
 - [ ] Send = `-` (Off): no batches arrive until **Send test message**, then the backlog follows. Set it back afterwards.
 - [ ] Batch records (ntfy "ChargeScreen data") contain `eng` (about 300 per record while driving), `pvs` (about 300 in full sun) and `sv`.
 - [ ] **`sv` parked = starter battery?** Compare the parked `sv` (or the Orion page input voltage) with a multimeter on the starter battery. If the Orion shows 0 V when off, the starter alert can't work: tell me.
-- [ ] **Drive 10+ minutes and park**: about 3 minutes after the engine stops, one **Parked** message with a position near the real one (tap it: Google Maps opens), `drove N min`, and `4G -NN dBm` if the Deco password is set. Serial: `Online: scan found N networks, M usable`, `geolocate -> HTTP 200`, `Online: park google`.
+- [ ] **Drive 10+ minutes and park**: about 3 minutes after the engine stops, one **Parked** message with a position near the real one (tap it: Google Maps opens), `drove N min`, and a network part such as `4G+ cov 60 qual 25 · 48 ms · 2.4 Mbit/s`. Serial: `Online: scan found N networks, M usable`, `geolocate -> HTTP 200`, `Online: network 4G+ cov .. qual .., .. ms, .. kbit/s`, `Online: park google`.
+- [ ] **Network readings while parked**: batch messages end with `"net":{...}` holding `ms` at every connection, and `kbps` about every 4 h. Serial shows `Online: network ...` at each connection.
 - [ ] **Same spot again**: run the engine 10+ minutes without moving, stop: Parked with `src` `same`, and no new call in the Google Cloud metrics.
 - [ ] **Short run**: engine on for 5 minutes, off: no Parked message.
 - [ ] **Quota** (optional): set the daily quota to 1, two drives: the second Parked says `Position unknown (quota)`. Restore the quota.
@@ -58,4 +57,4 @@ Tick each one and note anything odd (serial log lines start with `Online:` or `D
 
 ## 5. Report back
 
-- `ble_survey.json`, `cell_summary.json`, a serial log of one drive and park, and the ticked list.
+- `ble_survey.json`, the `geo_test.py` result, a serial log of one drive and park, and the ticked list.

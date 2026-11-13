@@ -240,8 +240,11 @@ static void test_deco_signal_and_helpers() {
   cs::DecoSignal sig;
   const char *reply =
       "{\"error_code\":0,\"result\":{\"mobile_cpe\":{\"dial_status\":\"connected\",\"network_type\":\"lte_plus\","
-      "\"rsrp\":-95,\"rsrq\":\"-11\",\"snr\":8.5,\"signal_strength\":75,\"cell\":{\"rsrp\":1}},\"rsrp\":-1}}";
+      "\"rsrp\":-95,\"rsrq\":\"-11\",\"snr\":8.5,\"rssi\":-57,\"signal_strength\":75,\"data_usage\":7929565,"
+      "\"cell\":{\"rsrp\":1}},\"rsrp\":-1}}";
   TEST_ASSERT_TRUE(cs::parseDecoSignal(reply, sig));
+  TEST_ASSERT_EQUAL_FLOAT(-57.0f, sig.rssi);
+  TEST_ASSERT_TRUE(sig.du == 7929565.0);
   TEST_ASSERT_EQUAL_STRING("lte_plus", sig.net);
   TEST_ASSERT_EQUAL_FLOAT(-95.0f, sig.rsrp);
   TEST_ASSERT_EQUAL_FLOAT(-11.0f, sig.rsrq);
@@ -265,6 +268,72 @@ static void test_deco_signal_and_helpers() {
   TEST_ASSERT_EQUAL_STRING("a%2Bb%2Fc%3D", enc);
 }
 
+// The values the Deco X1500-4G reported on 2026-11-13, plus measured lag and speed.
+static cs::NetReading reading() {
+  cs::NetReading n;
+  n.sig.valid = true;
+  snprintf(n.sig.net, sizeof n.sig.net, "lte_plus");
+  n.sig.rsrp = -96.0f;
+  n.sig.rsrq = -17.0f;
+  n.sig.snr = 2.0f;
+  n.sig.rssi = -57.0f;
+  n.sig.lvl = 80.0f;
+  n.sig.du = 7929565.0;
+  n.ms = 48;
+  n.kbps = 2400;
+  return n;
+}
+
+static void test_network_quality() {
+  TEST_ASSERT_EQUAL_STRING("4G+", cs::netTypeLabel("lte_plus"));
+  TEST_ASSERT_EQUAL_STRING("4G", cs::netTypeLabel("lte"));
+  TEST_ASSERT_EQUAL_STRING("5G", cs::netTypeLabel("5g_nsa"));
+  TEST_ASSERT_EQUAL_STRING("3G", cs::netTypeLabel("wcdma"));
+  TEST_ASSERT_EQUAL_STRING("3G", cs::netTypeLabel("hspa_plus"));
+  TEST_ASSERT_EQUAL_STRING("2G", cs::netTypeLabel("gsm"));
+  TEST_ASSERT_EQUAL_STRING("", cs::netTypeLabel("none"));
+  TEST_ASSERT_EQUAL_STRING("", cs::netTypeLabel(""));
+
+  cs::NetReading n = reading();
+  TEST_ASSERT_EQUAL_INT(60, cs::coverageScore(n.sig));
+  TEST_ASSERT_EQUAL_INT(25, cs::qualityScore(n.sig));
+  cs::DecoSignal g3;
+  g3.rssi = -85.0f;  // 3G: RSSI only, no quality
+  TEST_ASSERT_EQUAL_INT(50, cs::coverageScore(g3));
+  TEST_ASSERT_EQUAL_INT(-1, cs::qualityScore(g3));
+  cs::DecoSignal best;
+  best.rsrp = -60.0f;
+  best.snr = 30.0f;
+  best.rsrq = -3.0f;
+  TEST_ASSERT_EQUAL_INT(100, cs::coverageScore(best));
+  TEST_ASSERT_EQUAL_INT(100, cs::qualityScore(best));
+
+  const int32_t three[] = {120, 40, 55};
+  TEST_ASSERT_EQUAL_INT32(55, cs::medianMs(three, 3));
+  const int32_t oneFailed[] = {-1, 40, 60};
+  TEST_ASSERT_EQUAL_INT32(50, cs::medianMs(oneFailed, 3));
+  const int32_t twoFailed[] = {-1, 40, -1};
+  TEST_ASSERT_EQUAL_INT32(-1, cs::medianMs(twoFailed, 3));
+  TEST_ASSERT_EQUAL_INT32(2048, cs::throughputKbps(102400, 400));
+  TEST_ASSERT_EQUAL_INT32(-1, cs::throughputKbps(102400, 0));
+
+  char json[192];
+  cs::NetReading onlyLag;
+  onlyLag.ms = 33;
+  TEST_ASSERT_TRUE(cs::buildNetJson(json, sizeof json, onlyLag) > 0);
+  TEST_ASSERT_EQUAL_STRING("{\"ms\":33}", json);
+  cs::NetReading nothing;
+  TEST_ASSERT_EQUAL_UINT(0, cs::buildNetJson(json, sizeof json, nothing));
+
+  cs::Record rec;
+  rec.t = 5;
+  char batch[256];
+  TEST_ASSERT_TRUE(cs::buildBatchJson(batch, sizeof batch, &rec, 1, "{\"ms\":33}") > 0);
+  TEST_ASSERT_EQUAL_STRING("{\"v\":1,\"recs\":[{\"t\":5}],\"net\":{\"ms\":33}}", batch);
+  TEST_ASSERT_TRUE(cs::buildBatchJson(batch, sizeof batch, &rec, 1) > 0);
+  TEST_ASSERT_EQUAL_STRING("{\"v\":1,\"recs\":[{\"t\":5}]}", batch);
+}
+
 static void test_park_data_and_text() {
   cs::ParkResult r;
   r.t = 1762250000UL;
@@ -274,22 +343,20 @@ static void test_park_data_and_text() {
   r.lon = 2.35222f;
   r.acc = 38;
   r.aps = 9;
-  r.sig.valid = true;
-  snprintf(r.sig.net, sizeof r.sig.net, "lte_plus");
-  r.sig.rsrp = -95.0f;
-  r.sig.rsrq = -11.0f;
-  r.sig.snr = 8.5f;
-  r.sig.lvl = 75.0f;
+  r.net = reading();
   char data[cs::MSG_BODY_LEN];
   TEST_ASSERT_TRUE(cs::buildParkData(data, sizeof data, r) > 0);
   TEST_ASSERT_EQUAL_STRING(
       "{\"v\":1,\"t\":1762250000,\"run\":4380,\"src\":\"google\",\"lat\":48.85661,\"lon\":2.35222,\"acc\":38,"
-      "\"aps\":9,\"sig\":{\"net\":\"lte_plus\",\"rsrp\":-95,\"rsrq\":-11,\"snr\":8.5,\"lvl\":75}}",
+      "\"aps\":9,\"net\":{\"type\":\"4G+\",\"cov\":60,\"qual\":25,\"ms\":48,\"kbps\":2400,\"rsrp\":-96,\"rsrq\":-17,"
+      "\"snr\":2.0,\"rssi\":-57,\"lvl\":80,\"du\":7929565}}",
       data);
-  char text[128];
+  char text[160];
   char click[96];
   TEST_ASSERT_TRUE(cs::buildParkText(text, sizeof text, data, click, sizeof click) > 0);
-  TEST_ASSERT_EQUAL_STRING("48.85661, 2.35222 \xC2\xB1" "38 m \xC2\xB7 drove 1 h 13 min \xC2\xB7 4G -95 dBm", text);
+  TEST_ASSERT_EQUAL_STRING("48.85661, 2.35222 \xC2\xB1" "38 m \xC2\xB7 drove 1 h 13 min \xC2\xB7 4G+ cov 60 qual 25"
+                           " \xC2\xB7 48 ms \xC2\xB7 2.4 Mbit/s",
+                           text);
   TEST_ASSERT_EQUAL_STRING("https://maps.google.com/?q=48.85661,2.35222", click);
 
   cs::ParkResult none;
@@ -334,6 +401,7 @@ int main(int, char **) {
   RUN_TEST(test_geo_request_and_key);
   RUN_TEST(test_geo_responses);
   RUN_TEST(test_deco_signal_and_helpers);
+  RUN_TEST(test_network_quality);
   RUN_TEST(test_park_data_and_text);
   RUN_TEST(test_ntfy_click_and_kinds);
   return UNITY_END();

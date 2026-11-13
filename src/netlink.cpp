@@ -69,6 +69,13 @@ cs::ParkRequest pendingPark;
 bool parkPending = false;
 uint32_t parkSeq = 0;
 volatile bool engineRanFlag = false;
+volatile uint32_t lastEngineMs = 0;  // millis() of the last running sample, 0 = none this boot
+
+// Network quality (netlink task only).
+bool speedTimerSet = false;  // false: measure the download at the next parked connection
+uint32_t nextSpeedMs = 0;
+bool speedWanted = false;    // decided at the start of each attempt
+char netJsonBuffer[192];     // this connection's reading, sent with the first batch
 
 void setPendingPark(const cs::ParkRequest &req) {
   taskENTER_CRITICAL(&configMux);
@@ -117,6 +124,12 @@ uint8_t configuredBatchMin() {
 uint32_t untilMs(uint32_t target, uint32_t now) {
   int32_t diff = static_cast<int32_t>(target - now);
   return diff > 0 ? static_cast<uint32_t>(diff) : 0;
+}
+
+// No engine-running sample for PARK_SETTLE_MS (or none since boot).
+bool vanParked(uint32_t now) {
+  uint32_t last = lastEngineMs;
+  return last == 0 || now - last >= cs::PARK_SETTLE_MS;
 }
 
 void applyTimeZone(const char *tz) {
@@ -325,7 +338,88 @@ int32_t budgetDay(const cs::ClockNow &clock) {
                           : static_cast<int32_t>(clock.unixUtc / 86400U);
 }
 
-// After joining: position (Google or saved), Deco signal, then the park message.
+// Median of 3 small HTTP requests on one kept-alive connection (the first also
+// pays DNS and TCP setup). Plain HTTP, so no TLS handshake in the timing.
+int32_t measureLatency() {
+  WiFiClient client;
+  HTTPClient http;
+  http.setReuse(true);
+  http.setConnectTimeout(5000);
+  http.setTimeout(5000);
+  if (!http.begin(client, cs::LATENCY_URL)) {
+    return -1;
+  }
+  int32_t ms[3];
+  for (int i = 0; i < 3; i++) {
+    uint32_t start = millis();
+    int code = paused ? -1 : http.GET();
+    ms[i] = (code == 204 || code == 200) ? static_cast<int32_t>(millis() - start) : -1;
+  }
+  http.end();
+  return cs::medianMs(ms, 3);
+}
+
+// 100 KB from Cloudflare's speed test endpoint. The clock starts once the
+// response headers are in, so TLS setup and server delay are not counted.
+int32_t measureDownload() {
+  WiFiClientSecure client;
+  client.setInsecure();  // no certificate check, see the spec non-goals
+  client.setHandshakeTimeout(HTTP_TIMEOUT_MS / 1000);
+  HTTPClient http;
+  http.setConnectTimeout(HTTP_TIMEOUT_MS);
+  http.setTimeout(HTTP_TIMEOUT_MS);
+  if (!http.begin(client, cs::SPEED_URL)) {
+    return -1;
+  }
+  int code = http.GET();
+  if (code != 200) {
+    Serial.printf("Online: speed test HTTP %d\n", code);
+    http.end();
+    return -1;
+  }
+  WiFiClient *stream = http.getStreamPtr();
+  uint8_t chunk[512];
+  uint32_t got = 0;
+  uint32_t start = millis();
+  uint32_t lastData = start;
+  while (got < cs::SPEED_BYTES && millis() - lastData < HTTP_TIMEOUT_MS && !paused) {
+    size_t avail = stream->available();
+    if (avail) {
+      int n = stream->read(chunk, avail < sizeof(chunk) ? avail : sizeof(chunk));
+      if (n > 0) {
+        got += static_cast<uint32_t>(n);
+        lastData = millis();
+      }
+    } else if (!stream->connected()) {
+      break;
+    } else {
+      vTaskDelay(1);
+    }
+  }
+  uint32_t elapsed = millis() - start;
+  http.end();
+  return got >= cs::SPEED_BYTES ? cs::throughputKbps(got, elapsed) : -1;
+}
+
+// Deco radio values (if the password is set), lag, and optionally the download.
+void readNetwork(cs::NetReading &n, bool withSpeed) {
+  n = cs::NetReading();
+  if (activeConfig.decoPass[0] && !paused) {
+    String gateway = WiFi.gatewayIP().toString();
+    decoReadSignal(gateway.c_str(), activeConfig.decoPass, n.sig);
+  }
+  if (!paused) {
+    n.ms = measureLatency();
+  }
+  if (withSpeed && !paused) {
+    n.kbps = measureDownload();
+  }
+  Serial.printf("Online: network %s cov %d qual %d, %ld ms, %ld kbit/s\n", cs::netTypeLabel(n.sig.net),
+                n.sig.valid ? cs::coverageScore(n.sig) : -1, n.sig.valid ? cs::qualityScore(n.sig) : -1,
+                static_cast<long>(n.ms), static_cast<long>(n.kbps));
+}
+
+// After joining: position (Google or saved), network reading, then the park message.
 ParkStep handlePark(uint8_t apCount) {
   cs::ParkRequest req;
   uint32_t seq = 0;
@@ -394,12 +488,9 @@ ParkStep handlePark(uint8_t apCount) {
     }
   }
 
-  if (activeConfig.decoPass[0] && !paused) {
-    String gateway = WiFi.gatewayIP().toString();
-    if (decoReadSignal(gateway.c_str(), activeConfig.decoPass, r.sig)) {
-      Serial.printf("Online: Deco signal %s rsrp %.0f\n", r.sig.net, static_cast<double>(r.sig.rsrp));
-    }
-  }
+  readNetwork(r.net, true);  // a new place: always measure the download too
+  speedTimerSet = true;
+  nextSpeedMs = millis() + cs::SPEED_INTERVAL_MS;
 
   engineRanFlag = false;  // left over from the drive that just ended
   cs::watchSetReference(geoState, scanAps, apCount);
@@ -424,6 +515,7 @@ void processEngineFlag() {
     return;
   }
   engineRanFlag = false;
+  speedTimerSet = false;  // measure again at the next parking
   if (!watchActive) {
     return;
   }
@@ -530,7 +622,7 @@ Attempt sendAll() {
     size_t len;
     if (kind == cs::MsgKind::Park) {
       // The body is the data JSON; the human text is built from it.
-      char text[128];
+      char text[192];
       char click[96];
       cs::buildParkText(text, sizeof(text), messageBuffer.body, click, sizeof(click));
       len = ntfy ? cs::buildNtfyEnvelope(envelopeBuffer, sizeof(envelopeBuffer), topic, messageBuffer.title, text,
@@ -568,7 +660,12 @@ Attempt sendAll() {
       storeMarkRecordsSent(endSeq);  // skips undatable records from an earlier boot
       break;
     }
-    size_t len = cs::buildBatchJson(bodyBuffer, sizeof(bodyBuffer), batchRecords, count);
+    // The network reading rides on the first batch; drop it if it doesn't fit.
+    size_t len = cs::buildBatchJson(bodyBuffer, sizeof(bodyBuffer), batchRecords, count, netJsonBuffer);
+    if (len == 0 && netJsonBuffer[0]) {
+      netJsonBuffer[0] = '\0';
+      len = cs::buildBatchJson(bodyBuffer, sizeof(bodyBuffer), batchRecords, count);
+    }
     if (len > 0) {
       if (ntfy) {
         len = cs::buildNtfyEnvelope(envelopeBuffer, sizeof(envelopeBuffer), topic, cs::kindTitle(cs::MsgKind::Batch),
@@ -590,6 +687,7 @@ Attempt sendAll() {
     cs::NetResult result = cs::classifyHttp(code);
     if (result == cs::NetResult::Sent || result == cs::NetResult::Drop) {
       storeMarkRecordsSent(endSeq);
+      netJsonBuffer[0] = '\0';
       continue;
     }
     return resultOf(result);
@@ -639,6 +737,13 @@ Attempt runAttempt() {
       refreshOffset();
     }
     ParkStep park = (paused || !parkWaiting) ? ParkStep::Nothing : handlePark(apCount);
+    // While parked, every connection records the network; the park message already has one.
+    netJsonBuffer[0] = '\0';
+    if (!paused && park != ParkStep::Queued && vanParked(millis())) {
+      cs::NetReading reading;
+      readNetwork(reading, speedWanted);
+      cs::buildNetJson(netJsonBuffer, sizeof(netJsonBuffer), reading);
+    }
     result = paused ? Attempt::Paused : sendAll();
     if (result == Attempt::Done && park == ParkStep::Retry) {
       result = Attempt::Failed;  // back off, then retry the position lookup
@@ -693,6 +798,13 @@ void netTaskMain(void *) {
         waitMs = untilWatch > 0 ? untilWatch : 1;
       }
     }
+    // The 4 h download test while parked starts its own attempt, whatever the Send setting.
+    if (speedTimerSet && vanParked(now) && waitMs > 0) {
+      uint32_t untilSpeed = untilMs(nextSpeedMs, now);
+      if (untilSpeed < waitMs) {
+        waitMs = untilSpeed;
+      }
+    }
     if (waitMs > 0) {
       if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(waitMs)) > 0) {
         urgent = true;
@@ -707,6 +819,12 @@ void netTaskMain(void *) {
     taskEXIT_CRITICAL(&configMux);
     lastAttemptMs = millis();
     firstDone = true;
+    // Download at the first parked connection after a drive or boot, then every 4 h.
+    speedWanted = vanParked(lastAttemptMs) && (!speedTimerSet || untilMs(nextSpeedMs, lastAttemptMs) == 0);
+    if (speedWanted) {
+      speedTimerSet = true;
+      nextSpeedMs = lastAttemptMs + cs::SPEED_INTERVAL_MS;
+    }
 
     Attempt result = runAttempt();
     if (result == Attempt::Done) {
@@ -805,6 +923,8 @@ void netlinkRequestPark(const cs::ParkRequest &req) {
 }
 
 void netlinkEngineRunning() {
+  uint32_t now = millis();
+  lastEngineMs = now ? now : 1;
   engineRanFlag = true;
 }
 

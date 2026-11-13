@@ -118,7 +118,7 @@ The key is never shown on the info screen or in logs. Accepted characters: `A–
 Generic sink: `kind:"park"`, priority 2, `time` = engine-off time, `data`:
 
 ```json
-{"v":1,"t":1762250000,"run":4380,"src":"google","lat":48.85661,"lon":2.35222,"acc":38,"aps":9,"sig":{"net":"lte_plus","rsrp":-95,"rsrq":-11,"snr":8.5,"lvl":75}}
+{"v":1,"t":1762250000,"run":4380,"src":"google","lat":48.85661,"lon":2.35222,"acc":38,"aps":9,"net":{"type":"4G+","cov":60,"qual":25,"ms":48,"kbps":2400,"rsrp":-96,"rsrq":-17,"snr":2.0,"rssi":-57,"lvl":80,"du":7929565}}
 ```
 
 | Field | Meaning |
@@ -129,13 +129,13 @@ Generic sink: `kind:"park"`, priority 2, `time` = engine-off time, `data`:
 | `lat`, `lon` | 5 decimals. Present for `google` and `same` |
 | `acc` | Accuracy radius in metres (integer). Present for `google` and `same` |
 | `aps` | Usable access points after filtering |
-| `sig` | 4G signal from the Deco (Part 4). Left out when it could not be read |
+| `net` | Network reading (Part 4). Left out when nothing could be read |
 
 ntfy sink: title `Parked`, priority 2, tag `parking`.
 
-- With a position: `48.85661, 2.35222 ±38 m · drove 1 h 13 min · 4G -95 dBm`, with `click` set to `https://maps.google.com/?q=48.85661,2.35222`.
+- With a position: `48.85661, 2.35222 ±38 m · drove 1 h 13 min · 4G+ cov 60 qual 25 · 48 ms · 2.4 Mbit/s`, with `click` set to `https://maps.google.com/?q=48.85661,2.35222`.
 - Without one: `Position unknown (none) · drove 1 h 13 min`.
-- The signal part appears only when `sig` is present.
+- Each network part appears only when it was measured.
 
 ### Google setup (user, one-off)
 
@@ -144,14 +144,34 @@ ntfy sink: title `Parked`, priority 2, tag `parking`.
 3. Under Quotas, cap the Geolocation API at, for example, 300 requests a day, so it refuses calls rather than bill above the free allowance. The Geolocation SKU is in the Essentials tier (10,000 free calls a month under the March 2025 pricing).
 4. Paste the key into the setup page.
 
-## Part 4 — 4G signal at each parking (Deco)
+## Part 4 — Mobile network quality while parked
 
-**Gate:** implemented only after `tools/deco-probe` has shown, on the real Deco X1500-4G, that the owner-password login works and `admin/network?form=internet` returns a `mobile_cpe` object with `rsrp`. If it doesn't, Part 4 is skipped and the rest ships without it.
+Goal: how usable the internet is at each place the van parks (lag and speed), plus why (coverage and cell quality), so a backend can draw a coverage map from the parking positions.
 
-- Setting: **Deco password** on the setup page (password field, "Remove saved password" box), NVS key `deco_pass`. It is the Deco owner's TP-Link ID password. Empty means Part 4 is off.
-- During park handling (after the position step, while joined), netlink logs in to the WiFi gateway address (`WiFi.gatewayIP()`, plain HTTP), sends one read of `admin/network?form=internet`, and logs out. At most one login per parking; a failure only means no `sig` field.
-- Fields read from `result.mobile_cpe`: `network_type` → `net` (string, at most 15 characters), `rsrp`, `rsrq`, `snr`, `signal_strength` → `lvl` (0–100). Missing fields are left out of `sig`.
-- ntfy text shows `4G <rsrp> dBm` (or `4G <lvl>%` without `rsrp`).
+**Probe result (2026-11-13, Deco X1500-4G):** the owner-password login works; `admin/network?form=internet` → `result.mobile_cpe` gives `network_type` (`lte_plus`), `rsrp` -96, `rsrq` -17, `snr` 2, `rssi` -57, `signal_strength` 80, `data_usage` 7929565 (unit unconfirmed, resettable in the app), plus status and traffic fields that are not used. No cell ID, TAC, MCC or MNC anywhere (22 forms read), so Google lookups stay Wi-Fi only. `profile_name` is the saved APN profile label, not the operator, and is not used.
+
+### When
+
+- **Parked** means no engine-running sample for 3 min (`PARK_SETTLE_MS`), or none since boot. Nothing is measured while driving, since there is no position to attach it to.
+- **Every connection while parked** reads the Deco and the lag. The reading goes into the first batch message of that connection as `"net":{...}` after `recs` (left out if the batch would be too long).
+- **The download** runs in the park message, at the first parked connection after a drive or a boot, then every **4 h** while parked (`SPEED_INTERVAL_MS`), so the same place is measured at different times of day. The 4 h test starts its own connection, whatever the Send setting. A failed test waits for the next 4 h.
+- The park message always carries a full reading, with the download.
+
+### What
+
+| Field | Meaning |
+|---|---|
+| `type` | `5G`, `4G+`, `4G`, `3G`, `2G` from the Deco's `network_type`; left out when unknown |
+| `cov` | Coverage 0–100: RSRP from -120 dBm (0) to -80 dBm (100); RSSI from -110 to -60 dBm on 3G/2G |
+| `qual` | Cell quality 0–100: 60% SNR (-5 dB → 0, 20 dB → 100) + 40% RSRQ (-20 dB → 0, -5 dB → 100). Low with interference or a busy cell |
+| `ms` | Lag: median of 3 `GET http://connectivitycheck.gstatic.com/generate_204` on one kept-alive connection (the first also pays DNS and TCP setup; plain HTTP, so no TLS in the timing). Needs 2 of 3 to succeed |
+| `kbps` | Download speed of 100 KB from `https://speed.cloudflare.com/__down?bytes=102400`, timed from the response headers to the last byte. Limited to roughly 5–10 Mbit/s by the ESP32's own Wi-Fi |
+| `rsrp`, `rsrq`, `snr`, `rssi`, `lvl`, `du` | Raw Deco values, so the backend can recompute the scores |
+
+- The Deco part needs the **Deco password** (setup page, NVS key `deco_pass`); without it only `ms` and `kbps` are sent.
+- Data cost: about 1 KB per connection for the lag, 100 KB per download (at most 6 a day, about 20 MB a month).
+- ntfy text: `· 4G+ cov 60 qual 25 · 48 ms · 2.4 Mbit/s`.
+- Example with the probe values: cov 60, qual 25. That is a reachable mast on a crowded or noisy cell; the Deco's own 80% follows signal strength only.
 
 ### Deco local protocol
 
@@ -223,7 +243,7 @@ On the device:
 
 1. Settings page 3 shows four rows. Send cycles through the options and survives a reboot. The setup page shows the same value.
 2. Send = Off: no batches arrive until a test message is sent, and then the backlog follows.
-3. Drive at least 10 min and park: one `park` message about 3 min after the engine stops, with a position near the real one and, with the Deco password set, a `sig` part.
+3. Drive at least 10 min and park: one `park` message about 3 min after the engine stops, with a position near the real one and a network part (`4G+ cov .. qual .. · .. ms · .. Mbit/s`).
 4. Restart the engine and stop again in the same spot after 10+ min: `src:"same"`, and no Google call in the Cloud Console metrics.
 5. Wrong key: `src:"error"`. A daily quota of 1 in the Console and a second drive: `src:"quota"`.
 6. A 5 min engine run gives no `park` message.
