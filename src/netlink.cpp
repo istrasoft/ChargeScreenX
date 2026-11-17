@@ -563,9 +563,13 @@ ParkStep handlePark(uint8_t apCount) {
     }
   }
 
-  readNetwork(r.net, true);  // a new place: always measure the download too
-  speedTimerSet = true;  // a second reading once the van has been parked a while, then every 4 h
-  nextSpeedMs = millis() + cs::SPEED_AFTER_PARK_MS;
+  // After a drive the network is measured 15 min later (sent with a batch), then
+  // every 4 h. A fix without a drive (Report button, moved-van watch) measures now.
+  if (req.runS == 0) {
+    readNetwork(r.net, true);
+  }
+  speedTimerSet = true;
+  nextSpeedMs = millis() + (req.runS == 0 ? cs::SPEED_INTERVAL_MS : cs::SPEED_AFTER_PARK_MS);
 
   engineRanFlag = false;  // left over from the drive that just ended
   cs::watchSetReference(geoState, scanAps, apCount);
