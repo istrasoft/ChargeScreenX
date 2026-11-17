@@ -564,8 +564,8 @@ ParkStep handlePark(uint8_t apCount) {
   }
 
   readNetwork(r.net, true);  // a new place: always measure the download too
-  speedTimerSet = true;
-  nextSpeedMs = millis() + cs::SPEED_INTERVAL_MS;
+  speedTimerSet = true;  // a second reading once the van has been parked a while, then every 4 h
+  nextSpeedMs = millis() + cs::SPEED_AFTER_PARK_MS;
 
   engineRanFlag = false;  // left over from the drive that just ended
   cs::watchSetReference(geoState, scanAps, apCount);
@@ -812,11 +812,12 @@ Attempt runAttempt() {
       refreshOffset();
     }
     ParkStep park = (paused || !parkWaiting) ? ParkStep::Nothing : handlePark(apCount);
-    // While parked, every connection records the network; the park message already has one.
+    // While parked, a full reading (Deco, lag and download) 15 min after the park
+    // message, then every 4 h; the park message already has one.
     netJsonBuffer[0] = '\0';
-    if (!paused && park != ParkStep::Queued && vanParked(millis())) {
+    if (!paused && park != ParkStep::Queued && speedWanted && vanParked(millis())) {
       cs::NetReading reading;
-      readNetwork(reading, speedWanted);
+      readNetwork(reading, true);
       cs::buildNetJson(netJsonBuffer, sizeof(netJsonBuffer), reading);
     }
     result = paused ? Attempt::Paused : sendAll();
@@ -873,7 +874,7 @@ void netTaskMain(void *) {
         waitMs = untilWatch > 0 ? untilWatch : 1;
       }
     }
-    // The 4 h download test while parked starts its own attempt, whatever the Send setting.
+    // The network readings while parked start their own attempt, whatever the Send setting.
     if (speedTimerSet && vanParked(now) && waitMs > 0) {
       uint32_t untilSpeed = untilMs(nextSpeedMs, now);
       if (untilSpeed < waitMs) {
@@ -894,7 +895,8 @@ void netTaskMain(void *) {
     taskEXIT_CRITICAL(&configMux);
     lastAttemptMs = millis();
     firstDone = true;
-    // Download at the first parked connection after a drive or boot, then every 4 h.
+    // Full reading at the first parked connection after a boot, 15 min after a park
+    // message, then every 4 h.
     speedWanted = vanParked(lastAttemptMs) && (!speedTimerSet || untilMs(nextSpeedMs, lastAttemptMs) == 0);
     if (speedWanted) {
       speedTimerSet = true;

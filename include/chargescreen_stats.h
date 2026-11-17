@@ -2061,6 +2061,7 @@ constexpr const char *LATENCY_URL = "http://connectivitycheck.gstatic.com/genera
 constexpr const char *SPEED_URL = "https://speed.cloudflare.com/__down?bytes=102400";
 constexpr uint32_t SPEED_BYTES = 102400;
 constexpr uint32_t SPEED_INTERVAL_MS = 4UL * 3600000UL;  // while parked
+constexpr uint32_t SPEED_AFTER_PARK_MS = 15UL * 60000UL;  // second full reading this long after the park message
 
 // One reading of the mobile connection: Deco radio values plus measured lag and speed.
 struct NetReading {
