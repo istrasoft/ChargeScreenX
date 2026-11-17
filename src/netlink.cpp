@@ -310,18 +310,27 @@ void addDelayedSuffix(cs::Message &msg) {
   cs::insertAfterFirstLine(msg.body, sizeof(msg.body), suffix);
 }
 
-// STA scan without joining. Keeps the usable access points, strongest first.
-uint8_t scanAccessPoints() {
-  // Pause BLE scanning (owned by loop()) so the Wi-Fi scan gets the radio.
+// Asks loop() to pause BLE scanning so Wi-Fi gets the whole radio (the C3 has one).
+// Returns false if BLE did not stop in time; the caller goes on anyway.
+bool pauseBle(const char *why) {
   radioWanted = true;
   uint32_t waitStart = millis();
   while (!bleIdle && millis() - waitStart < BLE_PAUSE_WAIT_MS) {
     vTaskDelay(pdMS_TO_TICKS(20));
   }
-  bool blePaused = bleIdle;
-  if (!blePaused) {
-    Serial.println("Online: BLE scan not paused for the Wi-Fi scan");
+  if (!bleIdle) {
+    Serial.printf("Online: BLE scan not paused for the %s\n", why);
   }
+  return bleIdle;
+}
+
+void resumeBle() {
+  radioWanted = false;
+}
+
+// STA scan without joining. Keeps the usable access points, strongest first.
+uint8_t scanAccessPoints() {
+  pauseBle("Wi-Fi scan");
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
   // Pass 1: active (probe requests, quick answers). Pass 2: passive, listening
@@ -381,7 +390,7 @@ uint8_t scanAccessPoints() {
     }
     WiFi.scanDelete();
   }
-  radioWanted = false;
+  resumeBle();
   uint8_t before = n;
   n = cs::apDropOwnDevices(scanAps, n, own, ownCount);
   if (n != before) {
@@ -439,7 +448,7 @@ int32_t measureDownload() {
     return -1;
   }
   WiFiClient *stream = http.getStreamPtr();
-  uint8_t chunk[512];
+  static uint8_t chunk[2048];  // netlink task only; fewer, larger TLS reads
   uint32_t got = 0;
   uint32_t start = millis();
   uint32_t lastData = start;
@@ -469,13 +478,18 @@ void readNetwork(cs::NetReading &n, bool withSpeed) {
     String gateway = WiFi.gatewayIP().toString();
     decoReadSignal(gateway.c_str(), activeConfig.decoPass, n.sig);
   }
+  // With BLE scanning the radio is time-shared, which added lag and capped the
+  // download near 0.4 Mbit/s whatever the 4G link could do.
+  bool bleOff = !paused && pauseBle("network test");
   if (!paused) {
     n.ms = measureLatency();
   }
   if (withSpeed && !paused) {
     n.kbps = measureDownload();
   }
-  Serial.printf("Online: network %s cov %d qual %d, %ld ms, %ld kbit/s\n", cs::netTypeLabel(n.sig.net),
+  resumeBle();
+  Serial.printf("Online: network (BLE %s) %s cov %d qual %d, %ld ms, %ld kbit/s\n", bleOff ? "paused" : "on",
+                cs::netTypeLabel(n.sig.net),
                 n.sig.valid ? cs::coverageScore(n.sig) : -1, n.sig.valid ? cs::qualityScore(n.sig) : -1,
                 static_cast<long>(n.ms), static_cast<long>(n.kbps));
 }
