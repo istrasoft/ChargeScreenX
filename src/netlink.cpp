@@ -80,6 +80,9 @@ bool netTimerSet = false;    // false: read the network at the next parked conne
 uint32_t nextNetMs = 0;
 bool netWanted = false;      // decided at the start of each attempt
 char netJsonBuffer[192];     // this connection's reading, sent with the first batch
+cs::RemoteCommands attemptCommands;  // collected from the replies of this attempt (netlink task)
+volatile bool commandReport = false;  // handed to loop() at the end of the attempt
+volatile bool commandRestart = false;
 
 void setPendingPark(const cs::ParkRequest &req) {
   taskENTER_CRITICAL(&configMux);
@@ -675,9 +678,13 @@ Attempt sendAll() {
       storePopMessage(id);
       continue;
     }
-    int code = httpRequest(postUrl, envelopeBuffer, nullptr, 0, activeConfig.token);
+    int code = httpRequest(postUrl, envelopeBuffer, ntfy ? nullptr : responseBuffer, sizeof(responseBuffer),
+                           activeConfig.token);
     logHeap(cs::kindName(kind), code);
     cs::NetResult result = cs::classifyHttp(code);
+    if (!ntfy && result == cs::NetResult::Sent) {
+      cs::parseRemoteCommands(responseBuffer, attemptCommands);
+    }
     if (result == cs::NetResult::Sent || result == cs::NetResult::Drop) {
       storePopMessage(id);
       continue;
@@ -717,9 +724,13 @@ Attempt sendAll() {
       storeMarkRecordsSent(endSeq);
       continue;
     }
-    int code = httpRequest(postUrl, envelopeBuffer, nullptr, 0, activeConfig.token);
+    int code = httpRequest(postUrl, envelopeBuffer, ntfy ? nullptr : responseBuffer, sizeof(responseBuffer),
+                           activeConfig.token);
     logHeap("batch", code);
     cs::NetResult result = cs::classifyHttp(code);
+    if (!ntfy && result == cs::NetResult::Sent) {
+      cs::parseRemoteCommands(responseBuffer, attemptCommands);
+    }
     if (result == cs::NetResult::Sent || result == cs::NetResult::Drop) {
       storeMarkRecordsSent(endSeq);
       netJsonBuffer[0] = '\0';
@@ -863,7 +874,19 @@ void netTaskMain(void *) {
       nextNetMs = lastAttemptMs + cs::NET_INTERVAL_MS;
     }
 
+    attemptCommands = cs::RemoteCommands();
     Attempt result = runAttempt();
+    // Dashboard commands run after the attempt, so a restart never cuts a post short.
+    if (cs::remoteCommandsAny(attemptCommands)) {
+      Serial.printf("Online: dashboard asked for%s%s\n", attemptCommands.report ? " a report" : "",
+                    attemptCommands.restart ? " a restart" : "");
+      if (attemptCommands.report) {
+        commandReport = true;
+      }
+      if (attemptCommands.restart) {
+        commandRestart = true;
+      }
+    }
     if (result == Attempt::Done) {
       failures = 0;
       backoffActive = false;
@@ -961,6 +984,14 @@ void netlinkRequestPark(const cs::ParkRequest &req) {
 
 bool netlinkWantsRadio() {
   return radioWanted;
+}
+
+bool netlinkTakeCommands(bool &report, bool &restart) {
+  report = commandReport;
+  restart = commandRestart;
+  commandReport = false;
+  commandRestart = false;
+  return report || restart;
 }
 
 void netlinkSetBleIdle(bool idle) {

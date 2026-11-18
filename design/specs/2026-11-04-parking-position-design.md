@@ -207,6 +207,11 @@ The ESP32 uses its built-in mbedtls (RSA, AES, MD5, base64) and `esp_fill_random
 - A scan with fewer than 3 usable networks, or with some overlap, clears the suspicion.
 - Known limit: a campsite whose access points all switch off at night could raise a false alert. The no-overlap rule and the second scan make this rare.
 
+## Part 7 — Dashboard commands and starter alert level (beta4.23)
+
+- **Commands:** with the generic sink (HarmonyDash `/api/ingest`), the reply to any post may carry `"cmd":["report","restart"]` (`parseRemoteCommands`, unknown names ignored). Commands are collected over an attempt and handed to `loop()` once it ends, so a restart never cuts a post short. `report` = the Report row (status report + position fix + network reading); `restart` = `ESP.restart()` 3 s later. The ntfy sink never gets commands. HarmonyDash sends each command once and drops it after a day.
+- **Starter alert level:** setup page field "Starter battery alert below (V)", NVS key `starter_v`, 11.5–12.4 V (default 12.2 V, `STARTER_LOW_V`), kept below the 12.6 V re-arm level. `starterUpdate` takes it as `lowV`.
+
 ## Backend notes (not in this firmware)
 
 - Solar and weather forecast for the parked position (Open-Meteo, no key) and "panels producing less than forecast" checks.

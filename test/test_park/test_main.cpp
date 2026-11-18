@@ -80,6 +80,51 @@ static int feedStarter(cs::StarterWatch &w, uint32_t fromMs, uint32_t toMs, uint
   return fired;
 }
 
+static void test_remote_commands() {
+  cs::RemoteCommands c;
+  cs::parseRemoteCommands("{\"ok\":true,\"records\":12}", c);
+  TEST_ASSERT_FALSE(cs::remoteCommandsAny(c));
+  cs::parseRemoteCommands("{\"ok\":true,\"records\":0,\"cmd\":[]}", c);
+  TEST_ASSERT_FALSE(cs::remoteCommandsAny(c));
+  cs::parseRemoteCommands("{\"ok\":true,\"cmd\":[\"report\"]}", c);
+  TEST_ASSERT_TRUE(c.report);
+  TEST_ASSERT_FALSE(c.restart);
+  cs::RemoteCommands d;
+  cs::parseRemoteCommands("{\"cmd\":[\"reboot\",\"restart\",\"reports\"],\"x\":\"report\"}", d);
+  TEST_ASSERT_TRUE(d.restart);
+  TEST_ASSERT_FALSE(d.report);  // "reports" and a value outside the list don't count
+  cs::RemoteCommands e;
+  cs::parseRemoteCommands(nullptr, e);
+  cs::parseRemoteCommands("not json", e);
+  cs::parseRemoteCommands("{\"cmd\":[\"report\"", e);  // no closing bracket
+  TEST_ASSERT_FALSE(cs::remoteCommandsAny(e));
+}
+
+static int feedStarterAt(cs::StarterWatch &w, uint32_t fromMs, uint32_t toMs, uint8_t state, float v, float lowV) {
+  int fired = 0;
+  for (uint32_t t = fromMs; t < toMs; t += 10000UL) {
+    if (cs::starterUpdate(w, true, state, v, t, lowV).fired) {
+      fired++;
+    }
+  }
+  return fired;
+}
+
+static void test_starter_custom_level() {
+  // 12.1 V alerts at the default 12.2 V level, not at 12.0 V.
+  cs::StarterWatch w;
+  TEST_ASSERT_EQUAL_INT(0, feedStarterAt(w, 0, 200 * MIN, 0, 12.1f, 12.0f));
+  cs::StarterWatch w2;
+  TEST_ASSERT_EQUAL_INT(1, feedStarterAt(w2, 0, 200 * MIN, 0, 12.1f, 12.2f));
+  // A higher level alerts earlier.
+  cs::StarterWatch w3;
+  TEST_ASSERT_EQUAL_INT(1, feedStarterAt(w3, 0, 200 * MIN, 0, 12.3f, 12.4f));
+  TEST_ASSERT_EQUAL_FLOAT(12.2f, cs::sanitiseStarterV(NAN));
+  TEST_ASSERT_EQUAL_FLOAT(11.5f, cs::sanitiseStarterV(9.0f));
+  TEST_ASSERT_EQUAL_FLOAT(12.4f, cs::sanitiseStarterV(13.0f));
+  TEST_ASSERT_EQUAL_FLOAT(12.3f, cs::sanitiseStarterV(12.3f));
+}
+
 static void test_starter_settle_then_alert_once() {
   cs::StarterWatch w;
   TEST_ASSERT_EQUAL_INT(0, feedStarter(w, 0, 10 * MIN, 3, 14.2f));  // driving
@@ -420,5 +465,7 @@ int main(int, char **) {
   RUN_TEST(test_network_quality);
   RUN_TEST(test_park_data_and_text);
   RUN_TEST(test_ntfy_click_and_kinds);
+  RUN_TEST(test_remote_commands);
+  RUN_TEST(test_starter_custom_level);
   return UNITY_END();
 }

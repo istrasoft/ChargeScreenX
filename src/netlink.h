@@ -43,6 +43,9 @@ void netlinkEngineRunning();
 // stops BLE scanning and reports netlinkSetBleIdle(true) once it has stopped.
 bool netlinkWantsRadio();
 void netlinkSetBleIdle(bool idle);
+// Commands the dashboard returned in an ingest reply, handed over once per
+// finished attempt. Returns true (and clears them) when there are any. Called from loop().
+bool netlinkTakeCommands(bool &report, bool &restart);
 
 // UTC from the system clock, plus the local offset (lookup or TZ override).
 cs::ClockNow clockNow();

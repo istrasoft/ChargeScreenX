@@ -696,6 +696,7 @@ static void loadStoredSecrets() {
   onlineSettings.eveningHour = cs::sanitiseEveningHour(secrets.getUChar("evening_hour", 20));
   onlineSettings.batchMin = cs::sanitiseBatchMin(secrets.getUChar("batch_min", 30));
   onlineSettings.daysAvg = cs::sanitiseDaysAvg(secrets.getUChar("days_avg", 3));
+  onlineSettings.starterV = cs::sanitiseStarterV(secrets.getFloat("starter_v", cs::STARTER_LOW_V));
   solarArrayWatts = secrets.getUShort("solar_watts", DEFAULT_SOLAR_ARRAY_WATTS);
   uint16_t sanitisedSolarArrayWatts = sanitiseSolarArrayWatts(solarArrayWatts);
   if (sanitisedSolarArrayWatts != solarArrayWatts) {
@@ -2052,7 +2053,7 @@ static void appendOnlineSection(String &html) {
   static const uint8_t batchOptions[] = {15, 30, 60, 120, 240, 0};
   static const uint8_t dayOptions[] = {1, 2, 3, 4, 5, 6, 7};
   html += F("<h2>Online</h2>");
-  html += F("<p class='hint'>With a URL and a WiFi network set, ChargeScreen joins WiFi only to send drain alerts, a morning battery report, an evening solar report and a silent data batch. After a drive of 10+ minutes it reports where the van parked (needs a Google geolocation key) and the 4G signal there (needs the Deco owner password), warns when the starter battery runs low, and when the van seems to move with the engine off. Use an ntfy topic such as https://ntfy.sh/your_topic, or your own endpoint. A protected topic also needs an access token, sent as a Bearer header. Nothing is sent in demo mode. Status: ");
+  html += F("<p class='hint'>With a URL and a WiFi network set, ChargeScreen joins WiFi only to send drain alerts, a morning battery report, an evening solar report and a silent data batch. After a drive of 10+ minutes it reports where the van parked (needs a Google geolocation key) and the 4G signal there (needs the Deco owner password), warns when the starter battery runs low, and when the van seems to move with the engine off. Use an ntfy topic such as https://ntfy.sh/your_topic, or your own endpoint. A protected topic also needs an access token, sent as a Bearer header. With a HarmonyDash URL (https://.../api/ingest and its token), the dashboard can also ask for a report or a restart, done after the next upload. Nothing is sent in demo mode. Status: ");
   html += onlineStatusLine();
   html += F("</p>");
   appendWifiFields(html, 1, onlineWifiSsid[0], onlineWifiPass[0]);
@@ -2076,6 +2077,9 @@ static void appendOnlineSection(String &html) {
   html += F("'><input id='dis_win_min' name='dis_win_min' type='number' min='15' max='120' step='1' value='");
   html += onlineSettings.disWinMin;
   html += F("'></div>");
+  html += F("<label for='starter_v'>Starter battery alert below (V)</label><input id='starter_v' name='starter_v' type='number' min='11.5' max='12.4' step='0.05' value='");
+  html += String(onlineSettings.starterV, 2);
+  html += F("'>");
   appendSelect(html, "report_hour", "Morning report hour", reportHours, sizeof(reportHours), onlineSettings.reportHour, ":00");
   appendSelect(html, "evening_hour", "Evening report hour", eveningHours, sizeof(eveningHours), onlineSettings.eveningHour, ":00");
   html += F("<label for='batch_min'>Batch interval</label><select id='batch_min' name='batch_min'>");
@@ -2451,6 +2455,20 @@ static bool saveOnlineSettings() {
       if (amps != onlineSettings.disAmps) {
         onlineSettings.disAmps = amps;
         secrets.putFloat("dis_amps", amps);
+      }
+    } else {
+      ok = false;
+    }
+  }
+
+  String starterText = settingsServer.arg("starter_v");
+  starterText.trim();
+  if (starterText.length()) {
+    float volts = starterText.toFloat();
+    if (volts >= cs::STARTER_ALERT_MIN_V && volts <= cs::STARTER_ALERT_MAX_V) {
+      if (volts != onlineSettings.starterV) {
+        onlineSettings.starterV = volts;
+        secrets.putFloat("starter_v", volts);
       }
     } else {
       ok = false;
@@ -4143,6 +4161,30 @@ void setup() {
   Serial.println("BLE scan started");
 }
 
+// Commands from the dashboard (HarmonyDash), taken from netlink after an upload.
+static uint32_t remoteRestartAtMs = 0;
+
+static void serviceRemoteCommands() {
+  bool report = false;
+  bool restart = false;
+  if (netlinkTakeCommands(report, restart)) {
+    if (report) {
+      bool queued = onlineEnabled() && !demoModeEnabled && telemetryQueueReport();
+      Serial.printf("Dashboard report: %s\n", queued ? "queued" : "not queued (online off, demo, or no sample yet)");
+    }
+    if (restart && !remoteRestartAtMs) {
+      Serial.println("Dashboard restart: in 3 s");
+      remoteRestartAtMs = millis() + 3000UL;
+      if (!remoteRestartAtMs) {
+        remoteRestartAtMs = 1;
+      }
+    }
+  }
+  if (remoteRestartAtMs && static_cast<int32_t>(millis() - remoteRestartAtMs) >= 0) {
+    ESP.restart();
+  }
+}
+
 void loop() {
   static uint32_t lastDraw = 0;
   updateSettingsServer();
@@ -4155,6 +4197,7 @@ void loop() {
   updateReportFlash();
   updateScreenTimeout();
   netlinkSetSuppressed(demoModeEnabled);
+  serviceRemoteCommands();
   if (telemetrySampleDue(millis())) {
     telemetryLoop(telemetrySample(), demoModeEnabled, storedSolarKey.length() > 0, storedOrionKey.length() > 0);
   }

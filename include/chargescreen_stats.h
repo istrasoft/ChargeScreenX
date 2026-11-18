@@ -42,6 +42,7 @@ struct OnlineSettings {
   uint8_t eveningHour = 20;
   uint8_t batchMin = 30;
   uint8_t daysAvg = 3;
+  float starterV = 12.2f;  // starter battery alert below this (STARTER_LOW_V by default)
 };
 
 inline int clampInt(int v, int lo, int hi) {
@@ -53,6 +54,16 @@ inline float sanitiseDisAmps(float v) {
     return 4.0f;
   }
   return v < 0.5f ? 0.5f : (v > 50.0f ? 50.0f : v);
+}
+
+// Starter battery alert level: 11.5-12.4 V, so it stays below the 12.6 V re-arm level.
+constexpr float STARTER_ALERT_MIN_V = 11.5f;
+constexpr float STARTER_ALERT_MAX_V = 12.4f;
+inline float sanitiseStarterV(float v) {
+  if (std::isnan(v)) {
+    return 12.2f;
+  }
+  return v < STARTER_ALERT_MIN_V ? STARTER_ALERT_MIN_V : (v > STARTER_ALERT_MAX_V ? STARTER_ALERT_MAX_V : v);
 }
 
 inline uint16_t sanitiseDisWinMin(int v) {
@@ -1545,7 +1556,9 @@ struct StarterAlert {
   uint32_t offForS = 0;
 };
 
-inline StarterAlert starterUpdate(StarterWatch &w, bool valid, uint8_t state, float inputV, uint32_t nowMs) {
+// lowV: the alert level from the setup page (STARTER_LOW_V by default).
+inline StarterAlert starterUpdate(StarterWatch &w, bool valid, uint8_t state, float inputV, uint32_t nowMs,
+                                 float lowV = STARTER_LOW_V) {
   StarterAlert a;
   if (!valid) {
     return a;
@@ -1562,7 +1575,7 @@ inline StarterAlert starterUpdate(StarterWatch &w, bool valid, uint8_t state, fl
   if (!starterVoltageUsable(inputV) || nowMs - w.offSinceMs < STARTER_SETTLE_MS) {
     return a;
   }
-  if (inputV < STARTER_LOW_V) {
+  if (inputV < lowV) {
     w.highActive = false;
     if (!w.lowActive) {
       w.lowActive = true;
@@ -2215,6 +2228,51 @@ inline size_t urlEncode(char *out, size_t cap, const char *in) {
     }
   }
   return w.result();
+}
+
+// ---------------------------------------------------------------- remote commands
+
+// Commands from the dashboard, returned in the reply to a post to the generic
+// sink (HarmonyDash /api/ingest): {"ok":true,...,"cmd":["report","restart"]}.
+struct RemoteCommands {
+  bool report = false;   // status report + position fix + network reading, like the Report row
+  bool restart = false;  // restart the device
+};
+
+inline bool remoteCommandsAny(const RemoteCommands &c) {
+  return c.report || c.restart;
+}
+
+// Adds the commands found in a reply to c (unknown names are ignored).
+inline void parseRemoteCommands(const char *reply, RemoteCommands &c) {
+  if (!reply) {
+    return;
+  }
+  const char *v = jsonValueAfterKey(reply, "cmd");
+  if (!v || *v != '[') {
+    return;
+  }
+  const char *end = strchr(v, ']');
+  if (!end) {
+    return;
+  }
+  for (const char *p = v; p < end; ++p) {
+    if (*p != '"') {
+      continue;
+    }
+    const char *q = p + 1;
+    const char *close = strchr(q, '"');
+    if (!close || close > end) {
+      break;
+    }
+    size_t len = static_cast<size_t>(close - q);
+    if (len == 6 && strncmp(q, "report", 6) == 0) {
+      c.report = true;
+    } else if (len == 7 && strncmp(q, "restart", 7) == 0) {
+      c.restart = true;
+    }
+    p = close;
+  }
 }
 
 // ---------------------------------------------------------------- park message

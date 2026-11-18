@@ -451,7 +451,8 @@ void checkVehicle(const cs::Sample &sample, const cs::ClockNow &clock, uint32_t 
     netlinkRequestPark(req);
   }
   cs::StarterAlert starter =
-      cs::starterUpdate(starterWatch, sample.orionValid, sample.orionState, sample.orionInV, nowMs);
+      cs::starterUpdate(starterWatch, sample.orionValid, sample.orionState, sample.orionInV, nowMs,
+                        telemetrySettings.starterV);
   if (starter.fired) {
     cs::Message msg;
     cs::messageInit(msg, cs::MsgKind::Starter, storeBootId(), unixOr0, nowMs);
