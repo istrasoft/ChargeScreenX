@@ -76,9 +76,9 @@ volatile bool bleIdle = false;       // loop() has stopped BLE scanning
 constexpr uint32_t BLE_PAUSE_WAIT_MS = 1500;
 
 // Network quality (netlink task only).
-bool speedTimerSet = false;  // false: measure the download at the next parked connection
-uint32_t nextSpeedMs = 0;
-bool speedWanted = false;    // decided at the start of each attempt
+bool netTimerSet = false;    // false: read the network at the next parked connection
+uint32_t nextNetMs = 0;
+bool netWanted = false;      // decided at the start of each attempt
 char netJsonBuffer[192];     // this connection's reading, sent with the first batch
 
 void setPendingPark(const cs::ParkRequest &req) {
@@ -429,69 +429,25 @@ int32_t measureLatency() {
   return cs::medianMs(ms, 3);
 }
 
-// 100 KB from Cloudflare's speed test endpoint. The clock starts once the
-// response headers are in, so TLS setup and server delay are not counted.
-int32_t measureDownload() {
-  WiFiClientSecure client;
-  client.setInsecure();  // no certificate check, see the spec non-goals
-  client.setHandshakeTimeout(HTTP_TIMEOUT_MS / 1000);
-  HTTPClient http;
-  http.setConnectTimeout(HTTP_TIMEOUT_MS);
-  http.setTimeout(HTTP_TIMEOUT_MS);
-  if (!http.begin(client, cs::SPEED_URL)) {
-    return -1;
-  }
-  int code = http.GET();
-  if (code != 200) {
-    Serial.printf("Online: speed test HTTP %d\n", code);
-    http.end();
-    return -1;
-  }
-  WiFiClient *stream = http.getStreamPtr();
-  static uint8_t chunk[2048];  // netlink task only; fewer, larger TLS reads
-  uint32_t got = 0;
-  uint32_t start = millis();
-  uint32_t lastData = start;
-  while (got < cs::SPEED_BYTES && millis() - lastData < HTTP_TIMEOUT_MS && !paused) {
-    size_t avail = stream->available();
-    if (avail) {
-      int n = stream->read(chunk, avail < sizeof(chunk) ? avail : sizeof(chunk));
-      if (n > 0) {
-        got += static_cast<uint32_t>(n);
-        lastData = millis();
-      }
-    } else if (!stream->connected()) {
-      break;
-    } else {
-      vTaskDelay(1);
-    }
-  }
-  uint32_t elapsed = millis() - start;
-  http.end();
-  return got >= cs::SPEED_BYTES ? cs::throughputKbps(got, elapsed) : -1;
-}
-
-// Deco radio values (if the password is set), lag, and optionally the download.
-void readNetwork(cs::NetReading &n, bool withSpeed) {
+// Deco radio values (if the password is set) and the lag. The download test was
+// dropped in beta4.22: the ESP32's fixed 5.8 KB TCP window capped it near
+// 0.5 Mbit/s at a 100 ms lag, whatever the 4G link could do.
+void readNetwork(cs::NetReading &n) {
   n = cs::NetReading();
   if (activeConfig.decoPass[0] && !paused) {
     String gateway = WiFi.gatewayIP().toString();
     decoReadSignal(gateway.c_str(), activeConfig.decoPass, n.sig);
   }
-  // With BLE scanning the radio is time-shared, which added lag and capped the
-  // download near 0.4 Mbit/s whatever the 4G link could do.
+  // With BLE scanning the radio is time-shared, which adds lag.
   bool bleOff = !paused && pauseBle("network test");
   if (!paused) {
     n.ms = measureLatency();
   }
-  if (withSpeed && !paused) {
-    n.kbps = measureDownload();
-  }
   resumeBle();
-  Serial.printf("Online: network (BLE %s) %s cov %d qual %d, %ld ms, %ld kbit/s\n", bleOff ? "paused" : "on",
+  Serial.printf("Online: network (BLE %s) %s cov %d qual %d, %ld ms\n", bleOff ? "paused" : "on",
                 cs::netTypeLabel(n.sig.net),
                 n.sig.valid ? cs::coverageScore(n.sig) : -1, n.sig.valid ? cs::qualityScore(n.sig) : -1,
-                static_cast<long>(n.ms), static_cast<long>(n.kbps));
+                static_cast<long>(n.ms));
 }
 
 // After joining: position (Google or saved), network reading, then the park message.
@@ -566,10 +522,10 @@ ParkStep handlePark(uint8_t apCount) {
   // After a drive the network is measured 15 min later (sent with a batch), then
   // every 4 h. A fix without a drive (Report button, moved-van watch) measures now.
   if (req.runS == 0) {
-    readNetwork(r.net, true);
+    readNetwork(r.net);
   }
-  speedTimerSet = true;
-  nextSpeedMs = millis() + (req.runS == 0 ? cs::SPEED_INTERVAL_MS : cs::SPEED_AFTER_PARK_MS);
+  netTimerSet = true;
+  nextNetMs = millis() + (req.runS == 0 ? cs::NET_INTERVAL_MS : cs::NET_AFTER_PARK_MS);
 
   engineRanFlag = false;  // left over from the drive that just ended
   cs::watchSetReference(geoState, scanAps, apCount);
@@ -594,7 +550,7 @@ void processEngineFlag() {
     return;
   }
   engineRanFlag = false;
-  speedTimerSet = false;  // measure again at the next parking
+  netTimerSet = false;  // measure again at the next parking
   if (!watchActive) {
     return;
   }
@@ -816,12 +772,12 @@ Attempt runAttempt() {
       refreshOffset();
     }
     ParkStep park = (paused || !parkWaiting) ? ParkStep::Nothing : handlePark(apCount);
-    // While parked, a full reading (Deco, lag and download) 15 min after the park
-    // message, then every 4 h; the park message already has one.
+    // While parked, a reading (Deco and lag) 15 min after the park message of a
+    // drive, then every 4 h.
     netJsonBuffer[0] = '\0';
-    if (!paused && park != ParkStep::Queued && speedWanted && vanParked(millis())) {
+    if (!paused && park != ParkStep::Queued && netWanted && vanParked(millis())) {
       cs::NetReading reading;
-      readNetwork(reading, true);
+      readNetwork(reading);
       cs::buildNetJson(netJsonBuffer, sizeof(netJsonBuffer), reading);
     }
     result = paused ? Attempt::Paused : sendAll();
@@ -879,10 +835,10 @@ void netTaskMain(void *) {
       }
     }
     // The network readings while parked start their own attempt, whatever the Send setting.
-    if (speedTimerSet && vanParked(now) && waitMs > 0) {
-      uint32_t untilSpeed = untilMs(nextSpeedMs, now);
-      if (untilSpeed < waitMs) {
-        waitMs = untilSpeed;
+    if (netTimerSet && vanParked(now) && waitMs > 0) {
+      uint32_t untilNet = untilMs(nextNetMs, now);
+      if (untilNet < waitMs) {
+        waitMs = untilNet;
       }
     }
     if (waitMs > 0) {
@@ -901,10 +857,10 @@ void netTaskMain(void *) {
     firstDone = true;
     // Full reading at the first parked connection after a boot, 15 min after a park
     // message, then every 4 h.
-    speedWanted = vanParked(lastAttemptMs) && (!speedTimerSet || untilMs(nextSpeedMs, lastAttemptMs) == 0);
-    if (speedWanted) {
-      speedTimerSet = true;
-      nextSpeedMs = lastAttemptMs + cs::SPEED_INTERVAL_MS;
+    netWanted = vanParked(lastAttemptMs) && (!netTimerSet || untilMs(nextNetMs, lastAttemptMs) == 0);
+    if (netWanted) {
+      netTimerSet = true;
+      nextNetMs = lastAttemptMs + cs::NET_INTERVAL_MS;
     }
 
     Attempt result = runAttempt();

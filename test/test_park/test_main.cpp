@@ -328,8 +328,6 @@ static void test_network_quality() {
   TEST_ASSERT_EQUAL_INT32(50, cs::medianMs(oneFailed, 3));
   const int32_t twoFailed[] = {-1, 40, -1};
   TEST_ASSERT_EQUAL_INT32(-1, cs::medianMs(twoFailed, 3));
-  TEST_ASSERT_EQUAL_INT32(2048, cs::throughputKbps(102400, 400));
-  TEST_ASSERT_EQUAL_INT32(-1, cs::throughputKbps(102400, 0));
 
   char json[192];
   cs::NetReading onlyLag;

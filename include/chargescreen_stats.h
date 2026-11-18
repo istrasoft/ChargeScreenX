@@ -2058,16 +2058,14 @@ inline int qualityScore(const DecoSignal &s) {
 }
 
 constexpr const char *LATENCY_URL = "http://connectivitycheck.gstatic.com/generate_204";
-constexpr const char *SPEED_URL = "https://speed.cloudflare.com/__down?bytes=102400";
-constexpr uint32_t SPEED_BYTES = 102400;
-constexpr uint32_t SPEED_INTERVAL_MS = 4UL * 3600000UL;  // while parked
-constexpr uint32_t SPEED_AFTER_PARK_MS = 15UL * 60000UL;  // second full reading this long after the park message
+constexpr uint32_t NET_INTERVAL_MS = 4UL * 3600000UL;  // network reading while parked
+constexpr uint32_t NET_AFTER_PARK_MS = 15UL * 60000UL;  // first reading this long after a drive's park message
 
-// One reading of the mobile connection: Deco radio values plus measured lag and speed.
+// One reading of the mobile connection: Deco radio values plus the measured lag.
 struct NetReading {
   DecoSignal sig;
   int32_t ms = -1;    // median HTTP round trip, -1 = not measured
-  int32_t kbps = -1;  // 100 KB download speed, -1 = not measured
+  int32_t kbps = -1;  // download speed; no longer measured (beta4.22), kept in the format
 };
 
 inline bool netReadingAny(const NetReading &r) {
@@ -2098,15 +2096,8 @@ inline int32_t medianMs(const int32_t *v, uint8_t n) {
   return k % 2 ? ok[k / 2] : (ok[k / 2 - 1] + ok[k / 2]) / 2;
 }
 
-// bytes in ms -> kbit/s (bits per millisecond).
-inline int32_t throughputKbps(uint32_t bytes, uint32_t ms) {
-  if (ms == 0 || bytes == 0) {
-    return -1;
-  }
-  return static_cast<int32_t>((static_cast<uint64_t>(bytes) * 8U) / ms);
-}
-
-// {"type":"4G+","cov":60,"qual":25,"ms":48,"kbps":2400,"rsrp":-96,...}; 0 when there is nothing.
+// {"type":"4G+","cov":60,"qual":25,"ms":48,"rsrp":-96,...}; 0 when there is nothing.
+// kbps is only written if set (no longer measured since beta4.22).
 inline size_t buildNetJson(char *out, size_t cap, const NetReading &r) {
   TextWriter w(out, cap);
   if (!netReadingAny(r)) {

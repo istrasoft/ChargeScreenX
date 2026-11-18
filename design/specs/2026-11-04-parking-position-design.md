@@ -146,15 +146,16 @@ ntfy sink: title `Parked`, priority 2, tag `parking`.
 
 ## Part 4 — Mobile network quality while parked
 
-Goal: how usable the internet is at each place the van parks (lag and speed), plus why (coverage and cell quality), so a backend can draw a coverage map from the parking positions.
+Goal: how usable the internet is at each place the van parks (lag), plus why (coverage and cell quality), so a backend can draw a coverage map from the parking positions.
 
 **Probe result (2026-11-13, Deco X1500-4G):** the owner-password login works; `admin/network?form=internet` → `result.mobile_cpe` gives `network_type` (`lte_plus`), `rsrp` -96, `rsrq` -17, `snr` 2, `rssi` -57, `signal_strength` 80, `data_usage` 7929565 (unit unconfirmed, resettable in the app), plus status and traffic fields that are not used. No cell ID, TAC, MCC or MNC anywhere (22 forms read), so Google lookups stay Wi-Fi only. `profile_name` is the saved APN profile label, not the operator, and is not used.
 
 ### When
 
 - **Parked** means no engine-running sample for 3 min (`PARK_SETTLE_MS`), or none since boot. Nothing is measured while driving, since there is no position to attach it to.
-- **While parked**, the Deco, the lag and the download are always read together: 15 min after the park message of a drive (`SPEED_AFTER_PARK_MS`), then every **4 h** (`SPEED_INTERVAL_MS`), so the same place is measured at different times of day; also at the first parked connection after a boot. A fix without a drive (Report button, moved-van watch) measures at once, in its park message, and the next reading is 4 h later. The other readings start their own connection, whatever the Send setting, and go into the first batch message of that connection as `"net":{...}` after `recs` (left out if the batch would be too long). A failed test waits for the next 4 h. Until beta4.21 every parked connection read the Deco and the lag, the download ran every 4 h, and every park message had a full reading.
-- **Since beta4.21** BLE scanning is paused during the lag and download tests, as for the Wi-Fi scan: sharing the C3's radio with BLE capped the download near 0.4 Mbit/s. Wi-Fi power save stays on (the C3 refuses to turn it off while Bluetooth is initialised), so lag keeps a floor of about one beacon interval (~100 ms).
+- **While parked**, the Deco and the lag are read together: 15 min after the park message of a drive (`NET_AFTER_PARK_MS`), then every **4 h** (`NET_INTERVAL_MS`), so the same place is measured at different times of day; also at the first parked connection after a boot. A fix without a drive (Report button, moved-van watch) measures at once, in its park message, and the next reading is 4 h later. The other readings start their own connection, whatever the Send setting, and go into the first batch message of that connection as `"net":{...}` after `recs` (left out if the batch would be too long). Until beta4.21 every parked connection read the Deco and the lag, a download ran every 4 h, and every park message had a full reading.
+- **Since beta4.21** BLE scanning is paused during the lag test, as for the Wi-Fi scan, so the radio is not time-shared. A test with BLE fully stopped and Wi-Fi power save off (beta4.22 trial) gave the same lag, about 100–110 ms: that is the real 4G round trip, not the ESP32.
+- **No download test since beta4.22.** The 100 KB download was capped at about 0.5 Mbit/s by the ESP32 itself: its TCP receive window is fixed at 5,760 bytes in the precompiled Arduino libraries, and TCP moves at most one window per round trip (5,760 B / ~0.1 s). It measured the device, not the 4G link, and cost ~20 MB a month. Lag plus the coverage and quality scores describe the link instead.
 
 ### What
 
@@ -164,12 +165,12 @@ Goal: how usable the internet is at each place the van parks (lag and speed), pl
 | `cov` | Coverage 0–100: RSRP from -120 dBm (0) to -80 dBm (100); RSSI from -110 to -60 dBm on 3G/2G |
 | `qual` | Cell quality 0–100: 60% SNR (-5 dB → 0, 20 dB → 100) + 40% RSRQ (-20 dB → 0, -5 dB → 100). Low with interference or a busy cell |
 | `ms` | Lag: median of 3 `GET http://connectivitycheck.gstatic.com/generate_204` on one kept-alive connection (the first also pays DNS and TCP setup; plain HTTP, so no TLS in the timing). Needs 2 of 3 to succeed |
-| `kbps` | Download speed of 100 KB from `https://speed.cloudflare.com/__down?bytes=102400`, timed from the response headers to the last byte. Limited to roughly 5–10 Mbit/s by the ESP32's own Wi-Fi |
+| `kbps` | Download speed. No longer sent since beta4.22 (see above); readers keep accepting it for older messages |
 | `rsrp`, `rsrq`, `snr`, `rssi`, `lvl`, `du` | Raw Deco values, so the backend can recompute the scores |
 
-- The Deco part needs the **Deco password** (setup page, NVS key `deco_pass`); without it only `ms` and `kbps` are sent.
-- Data cost: about 100 KB per reading: 6 a day while parked, plus 1 per parking (about 20 MB a month).
-- ntfy text: `· 4G+ cov 60 qual 25 · 48 ms · 2.4 Mbit/s`.
+- The Deco part needs the **Deco password** (setup page, NVS key `deco_pass`); without it only `ms` is sent.
+- Data cost: about 1 KB per reading (Deco and three small HTTP requests).
+- ntfy text: `· 4G+ cov 60 qual 25 · 48 ms` (a speed part only in messages from older firmware).
 - Example with the probe values: cov 60, qual 25. That is a reachable mast on a crowded or noisy cell; the Deco's own 80% follows signal strength only.
 
 ### Deco local protocol
